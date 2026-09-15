@@ -1,4 +1,4 @@
 hi Chee-An
 
-hi kalebhi kaleb
+hi kaleb
 This is a comment
