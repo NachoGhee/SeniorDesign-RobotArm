@@ -48,6 +48,7 @@ def main():
     controller = pygame.joystick.Joystick(0)
     print(f"Controller: {controller.get_name()}")
     print(f"Connecting to ESP32 on {SERIAL_PORT} at {BAUD_RATE} baud...")
+    print("Keys: S=confirm SSI, C=confirm calibration, A=arm, D=disarm; controller button 1=E-stop.")
 
     try:
         port = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0)
@@ -76,6 +77,16 @@ def main():
                     port.write(b"X\n")
                     print("E-stop sent; controller must be power-cycled to clear it.")
                     running = False
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_s:
+                    port.write(b"CFG,SSI,1\n")
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_c:
+                    port.write(b"CFG,CAL,1\n")
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_a:
+                    port.write(b"ARM\n")
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_d:
+                    port.write(b"DISARM\n")
+                    target_angles = None
+                    controller_ready = False
 
             now = time.monotonic()
             telemetry = read_telemetry(port, receive_buffer)
@@ -93,6 +104,7 @@ def main():
                         print("Controller ready; targets initialized from encoder feedback.")
                 else:
                     controller_ready = False
+                    target_angles = None
 
             if now - last_telemetry_time > 0.5:
                 controller_ready = False
