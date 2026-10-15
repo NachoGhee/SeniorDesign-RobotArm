@@ -93,7 +93,19 @@ def run_gcode_stream(port, source):
             return
     send_gcode_line(port, "M18", receive_buffer)
 
+pygame.init()
+    pygame.joystick.init()
+    
+    # --- ADD THIS HUD SETUP ---
+    screen = pygame.display.set_mode((500, 250))
+    pygame.display.set_caption("POSE Arm Kinematics HUD")
+    font = pygame.font.SysFont("consolas", 24)
+    # --------------------------
 
+    if pygame.joystick.get_count() == 0:
+        print("No controller found.")
+        pygame.quit()
+        return 1
 def main(argv=None):
     parser = argparse.ArgumentParser(description="POSE Raspberry Pi serial and joystick controller")
     parser.add_argument("--port", default=SERIAL_PORT, help="ESP32 serial port; defaults to POSE_SERIAL_PORT or /dev/ttyACM0")
