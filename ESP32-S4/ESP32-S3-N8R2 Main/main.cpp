@@ -817,7 +817,15 @@ void readSerial() {
         if (value == '\r') continue;
         if (value == '\n') {
             serialBuffer[serialLength] = '\0';
-            if (serialLength > 0) processCommand(serialBuffer);
+            if (serialLength > 0) {
+                
+                // --- NEW ECHO CODE ---
+                Serial.print("\n[RECEIVED COMMAND]: ");
+                Serial.println(serialBuffer);
+                // ---------------------
+                
+                processCommand(serialBuffer);
+            }
             serialLength = 0;
         } else if (serialLength + 1 < sizeof(serialBuffer)) {
             serialBuffer[serialLength++] = value;
