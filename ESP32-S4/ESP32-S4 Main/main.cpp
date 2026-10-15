@@ -20,6 +20,17 @@ constexpr float MAX_STEP_RATE = 10000.0f;
 constexpr uint32_t STEPPER_TASK_STACK_BYTES = 4096;
 constexpr UBaseType_t STEPPER_TASK_PRIORITY = 3;
 constexpr BaseType_t STEPPER_TASK_CORE = 0;
+constexpr bool BENCH_TEST_MODE = false;
+// Bit N enables motor channel N for bench commands; only enabled channels need pins.
+constexpr uint8_t BENCH_MOTOR_MASK = 0x01;
+// Bit N enables encoder channel N; use zero when testing motors without encoders.
+constexpr uint8_t BENCH_ENCODER_MASK = 0x00;
+constexpr long BENCH_MAX_STEPS_PER_SECOND = 200;
+constexpr uint32_t BENCH_MAX_DURATION_MS = 1000;
+static_assert(BENCH_MOTOR_MASK != 0 && (BENCH_MOTOR_MASK & ~0x7F) == 0,
+              "Bench mode requires a valid motor channel mask");
+static_assert((BENCH_ENCODER_MASK & ~0x3F) == 0,
+              "Bench encoder mask contains an invalid channel");
 
 // Set these GPIOs from the final ESP32-S3 board pinout.
 const int8_t SSI_CLK_PIN = -1;
@@ -79,6 +90,8 @@ volatile bool haveTarget = false;
 volatile bool driversEnabled = false;
 volatile bool eStopLatched = false;
 volatile bool stepperTaskReady = false;
+volatile int8_t benchMotorIndex = -1;
+uint32_t benchStopAtMs = 0;
 bool gcodeRelativeMode = false;
 uint32_t emergencyDisableSetLow = 0;
 uint32_t emergencyDisableClearLow = 0;
@@ -92,22 +105,59 @@ bool validPin(int8_t pin) {
     return pin >= 0 && pin <= 48 && pin != 0 && pin != 3 && pin != 45 && pin != 46;
 }
 
+bool motorChannelConfigured(uint8_t index) {
+    return index < MOTOR_COUNT &&
+           (!BENCH_TEST_MODE || (BENCH_MOTOR_MASK & (1U << index)) != 0);
+}
+
+bool encoderChannelConfigured(uint8_t index) {
+    return index < JOINT_COUNT &&
+           (!BENCH_TEST_MODE || (BENCH_ENCODER_MASK & (1U << index)) != 0);
+}
+
 bool encoderPinsReady() {
+    bool anyConfigured = false;
+    for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
+        if (encoderChannelConfigured(i)) anyConfigured = true;
+    }
+    if (!anyConfigured) return BENCH_TEST_MODE;
     if (!validPin(SSI_CLK_PIN) || !validPin(SSI_DO_PIN) || SSI_CLK_PIN == SSI_DO_PIN) return false;
     for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
+        if (!encoderChannelConfigured(i)) continue;
         if (!validPin(ENCODER_CSN_PINS[i]) || ENCODER_CSN_PINS[i] == SSI_CLK_PIN ||
             ENCODER_CSN_PINS[i] == SSI_DO_PIN) return false;
         for (uint8_t j = 0; j < i; ++j) {
-            if (ENCODER_CSN_PINS[i] == ENCODER_CSN_PINS[j]) return false;
+            if (encoderChannelConfigured(j) && ENCODER_CSN_PINS[i] == ENCODER_CSN_PINS[j]) return false;
         }
     }
     return true;
 }
 
 bool motorPinsReady() {
+    if (BENCH_TEST_MODE && BENCH_MOTOR_MASK == 0) return false;
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+        if (!motorChannelConfigured(i)) continue;
         if (!validPin(STEP_PINS[i]) || !validPin(DIR_PINS[i]) || !validPin(ENABLE_PINS[i]) ||
             STEP_PINS[i] == DIR_PINS[i] || STEP_PINS[i] == ENABLE_PINS[i] || DIR_PINS[i] == ENABLE_PINS[i]) return false;
+        for (uint8_t j = 0; j < i; ++j) {
+            if (!motorChannelConfigured(j)) continue;
+            if (STEP_PINS[i] == STEP_PINS[j] || STEP_PINS[i] == DIR_PINS[j] ||
+                STEP_PINS[i] == ENABLE_PINS[j] || DIR_PINS[i] == STEP_PINS[j] ||
+                DIR_PINS[i] == DIR_PINS[j] || DIR_PINS[i] == ENABLE_PINS[j] ||
+                ENABLE_PINS[i] == STEP_PINS[j] || ENABLE_PINS[i] == DIR_PINS[j] ||
+                ENABLE_PINS[i] == ENABLE_PINS[j]) return false;
+        }
+    }
+    return true;
+}
+
+bool benchConfigReady() {
+    if (!BENCH_TEST_MODE || !motorPinsReady() || !validPin(EMERGENCY_STOP_PIN)) return false;
+    if (BENCH_ENCODER_MASK != 0 && (!encoderPinsReady() || !SSI_MODE_CONFIRMED)) return false;
+    for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+        if (!motorChannelConfigured(i)) continue;
+        if (EMERGENCY_STOP_PIN == STEP_PINS[i] || EMERGENCY_STOP_PIN == DIR_PINS[i] ||
+            EMERGENCY_STOP_PIN == ENABLE_PINS[i]) return false;
     }
     return true;
 }
@@ -133,6 +183,7 @@ bool motionConfigReady() {
 bool allEncodersValid() {
     if (faultMask != 0) return false;
     for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
+        if (!encoderChannelConfigured(i)) continue;
         if (!encoders[i].valid) return false;
     }
     return true;
@@ -140,15 +191,20 @@ bool allEncodersValid() {
 
 void disableDrivers() {
     driversEnabled = false;
+    benchMotorIndex = -1;
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
         motors[i].stepsPerSecond = 0;
-        if (validPin(ENABLE_PINS[i])) digitalWrite(ENABLE_PINS[i], !DRIVER_ENABLE_ACTIVE_LEVEL[i]);
+        if (motorChannelConfigured(i) && validPin(ENABLE_PINS[i])) {
+            digitalWrite(ENABLE_PINS[i], !DRIVER_ENABLE_ACTIVE_LEVEL[i]);
+        }
     }
 }
 
 void enableDrivers() {
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
-        digitalWrite(ENABLE_PINS[i], DRIVER_ENABLE_ACTIVE_LEVEL[i]);
+        if (motorChannelConfigured(i) && (!BENCH_TEST_MODE || i == benchMotorIndex)) {
+            digitalWrite(ENABLE_PINS[i], DRIVER_ENABLE_ACTIVE_LEVEL[i]);
+        }
     }
     driversEnabled = true;
 }
@@ -169,7 +225,7 @@ void prepareEmergencyDisableMasks() {
     emergencyDisableSetHigh = 0;
     emergencyDisableClearHigh = 0;
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
-        if (!validPin(ENABLE_PINS[i])) continue;
+        if (!motorChannelConfigured(i) || !validPin(ENABLE_PINS[i])) continue;
         const bool disableLevel = !DRIVER_ENABLE_ACTIVE_LEVEL[i];
         if (ENABLE_PINS[i] < 32) {
             const uint32_t bit = 1UL << ENABLE_PINS[i];
@@ -194,7 +250,7 @@ uint8_t calculateCrc6(uint32_t data18) {
 }
 
 bool readEncoder(uint8_t index) {
-    if (!encoderPinsReady()) return false;
+    if (!encoderChannelConfigured(index) || !encoderPinsReady()) return false;
     SPI.beginTransaction(SPISettings(SSI_CLOCK_HZ, MSBFIRST, SPI_MODE2));
     digitalWrite(ENCODER_CSN_PINS[index], LOW);
     delayMicroseconds(1);
@@ -227,6 +283,7 @@ bool readEncoder(uint8_t index) {
 void readAllEncoders() {
     faultMask = 0;
     for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
+        if (!encoderChannelConfigured(i)) continue;
         if (!readEncoder(i)) faultMask |= 1U << i;
     }
     if (faultMask != 0) {
@@ -240,6 +297,7 @@ void stopAndLatch(const char *reason) {
     eStopLatched = true;
     MOTION_ENABLED = false;
     haveTarget = false;
+    benchStopAtMs = 0;
     stopServiced = true;
     disableDrivers();
     Serial.print("FAULT,");
@@ -266,8 +324,72 @@ void sendTelemetry() {
 }
 
 bool processSetupCommand(char *line) {
-    if (strcmp(line, "ARM") == 0) {
+    if (strncmp(line, "BENCH,", 6) == 0) {
+        if (!BENCH_TEST_MODE) {
+            Serial.println("ERR,BENCH_DISABLED");
+            return true;
+        }
+        char *save = nullptr;
+        strtok_r(line, ",", &save);
+        char *channelField = strtok_r(nullptr, ",", &save);
+        char *rateField = strtok_r(nullptr, ",", &save);
+        char *durationField = strtok_r(nullptr, ",", &save);
+        if (channelField == nullptr || rateField == nullptr || durationField == nullptr ||
+            strtok_r(nullptr, ",", &save) != nullptr) {
+            Serial.println("ERR,BENCH_FORMAT");
+            return true;
+        }
+        char *end = nullptr;
+        const long channel = strtol(channelField, &end, 10);
+        if (end == channelField || *end != '\0' || channel < 0 || channel >= MOTOR_COUNT ||
+            !motorChannelConfigured(static_cast<uint8_t>(channel))) {
+            Serial.println("ERR,BENCH_CHANNEL");
+            return true;
+        }
+        end = nullptr;
+        const long rate = strtol(rateField, &end, 10);
+        if (end == rateField || *end != '\0' || rate == 0 ||
+            rate < -BENCH_MAX_STEPS_PER_SECOND || rate > BENCH_MAX_STEPS_PER_SECOND) {
+            Serial.println("ERR,BENCH_RATE");
+            return true;
+        }
+        end = nullptr;
+        const long duration = strtol(durationField, &end, 10);
+        if (end == durationField || *end != '\0' || duration < 1 ||
+            duration > BENCH_MAX_DURATION_MS) {
+            Serial.println("ERR,BENCH_DURATION");
+            return true;
+        }
         if (eStopLatched) {
+            Serial.println("ERR,ESTOP");
+            return true;
+        }
+        if (!benchConfigReady() || !stepperTaskReady) {
+            Serial.println("ERR,BENCH_NOT_CONFIGURED");
+            return true;
+        }
+        for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
+            if (encoderChannelConfigured(i) && !encoders[i].valid) {
+                Serial.println("ERR,BENCH_ENCODER");
+                return true;
+            }
+        }
+
+        disableDrivers();
+        benchMotorIndex = static_cast<int8_t>(channel);
+        motors[channel].stepsPerSecond = static_cast<float>(rate);
+        haveTarget = true;
+        MOTION_ENABLED = true;
+        lastCommandMs = millis();
+        benchStopAtMs = lastCommandMs + static_cast<uint32_t>(duration);
+        enableDrivers();
+        Serial.println("OK,BENCH_STARTED");
+        return true;
+    }
+    if (strcmp(line, "ARM") == 0) {
+        if (BENCH_TEST_MODE) {
+            Serial.println("ERR,BENCH_ONLY");
+        } else if (eStopLatched) {
             Serial.println("ERR,ESTOP");
         } else if (!motionConfigReady()) {
             Serial.println("ERR,NOT_CONFIGURED");
@@ -284,6 +406,7 @@ bool processSetupCommand(char *line) {
     if (strcmp(line, "DISARM") == 0) {
         MOTION_ENABLED = false;
         haveTarget = false;
+        benchStopAtMs = 0;
         disableDrivers();
         Serial.println("OK,DISARMED");
         return true;
@@ -324,6 +447,10 @@ bool processSetupCommand(char *line) {
 }
 
 void acceptJointTarget(const float requested[JOINT_COUNT]) {
+    if (BENCH_TEST_MODE) {
+        Serial.println("ERR,BENCH_ONLY");
+        return;
+    }
     if (eStopLatched) {
         Serial.println("ERR,ESTOP");
         return;
@@ -517,6 +644,7 @@ void readSerial() {
 }
 
 void updatePositionController() {
+    if (BENCH_TEST_MODE) return;
     if (!motionConfigReady() || !MOTION_ENABLED || !haveTarget || !driversEnabled || eStopLatched || faultMask != 0) return;
     if (millis() - lastCommandMs > COMMAND_TIMEOUT_MS) {
         haveTarget = false;
@@ -550,6 +678,7 @@ void updateMotorOutputs() {
             digitalWrite(STEP_PINS[i], LOW);
             motor.stepHigh = false;
         }
+        if (!motorChannelConfigured(i) || (BENCH_TEST_MODE && i != benchMotorIndex)) continue;
         if (!MOTION_ENABLED || !haveTarget || !driversEnabled || eStopLatched || faultMask != 0) continue;
         const float rate = motors[i].stepsPerSecond;
         if (fabsf(rate) < 1.0f || motor.stepHigh) continue;
@@ -583,6 +712,7 @@ void stepperTask(void *) {
 void setup() {
     Serial.begin(SERIAL_BAUD);
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+        if (!motorChannelConfigured(i)) continue;
         if (validPin(STEP_PINS[i])) {
             pinMode(STEP_PINS[i], OUTPUT);
             digitalWrite(STEP_PINS[i], LOW);
@@ -602,8 +732,9 @@ void setup() {
         attachInterrupt(digitalPinToInterrupt(EMERGENCY_STOP_PIN), emergencyStopISR, FALLING);
         if (digitalRead(EMERGENCY_STOP_PIN) == LOW) emergencyStopISR();
     }
-    if (encoderPinsReady()) {
+    if (encoderPinsReady() && (!BENCH_TEST_MODE || BENCH_ENCODER_MASK != 0)) {
         for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
+            if (!encoderChannelConfigured(i)) continue;
             pinMode(ENCODER_CSN_PINS[i], OUTPUT);
             digitalWrite(ENCODER_CSN_PINS[i], HIGH);
         }
@@ -613,11 +744,23 @@ void setup() {
     stepperTaskReady = xTaskCreatePinnedToCore(stepperTask, "stepper", STEPPER_TASK_STACK_BYTES, nullptr,
                                                STEPPER_TASK_PRIORITY, nullptr, STEPPER_TASK_CORE) == pdPASS;
     if (!stepperTaskReady) Serial.println("ERR,STEPPER_TASK_CREATE");
-    Serial.println("POSE ready; send CFG,SSI,1 and CFG,CAL,1 after verification, then ARM.");
+    if (BENCH_TEST_MODE) {
+        Serial.println("BENCH mode: BENCH,<channel 0-6>,<signed steps/s>,<duration ms>; DISARM stops.");
+    } else {
+        Serial.println("POSE ready; send CFG,SSI,1 and CFG,CAL,1 after verification, then ARM.");
+    }
 }
 
 void loop() {
     readSerial();
+    if (BENCH_TEST_MODE && benchStopAtMs != 0 &&
+        static_cast<int32_t>(millis() - benchStopAtMs) >= 0) {
+        MOTION_ENABLED = false;
+        haveTarget = false;
+        benchStopAtMs = 0;
+        disableDrivers();
+        Serial.println("OK,BENCH_DONE");
+    }
     if (eStopLatched && !stopServiced) {
         stopServiced = true;
         haveTarget = false;
@@ -626,7 +769,8 @@ void loop() {
         Serial.println("FAULT,HARDWARE_ESTOP");
     }
     const uint32_t now = micros();
-    if (encoderPinsReady() && static_cast<uint32_t>(now - lastSensorUs) >= SENSOR_PERIOD_US) {
+    if ((!BENCH_TEST_MODE || BENCH_ENCODER_MASK != 0) && encoderPinsReady() &&
+        static_cast<uint32_t>(now - lastSensorUs) >= SENSOR_PERIOD_US) {
         lastSensorUs = now;
         readAllEncoders();
     }
