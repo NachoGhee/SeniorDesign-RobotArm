@@ -93,19 +93,6 @@ def run_gcode_stream(port, source):
             return
     send_gcode_line(port, "M18", receive_buffer)
 
-pygame.init()
-    pygame.joystick.init()
-    
-    # --- ADD THIS HUD SETUP ---
-    screen = pygame.display.set_mode((500, 250))
-    pygame.display.set_caption("POSE Arm Kinematics HUD")
-    font = pygame.font.SysFont("consolas", 24)
-    # --------------------------
-
-    if pygame.joystick.get_count() == 0:
-        print("No controller found.")
-        pygame.quit()
-        return 1
 def main(argv=None):
     parser = argparse.ArgumentParser(description="POSE Raspberry Pi serial and joystick controller")
     parser.add_argument("--port", default=SERIAL_PORT, help="ESP32 serial port; defaults to POSE_SERIAL_PORT or /dev/ttyACM0")
@@ -141,6 +128,10 @@ def main(argv=None):
         pygame.quit()
         port.close()
         return 1
+
+    screen = pygame.display.set_mode((500, 250))
+    pygame.display.set_caption("POSE Arm Kinematics HUD")
+    font = pygame.font.SysFont("consolas", 24)
 
     controller = pygame.joystick.Joystick(0)
     print(f"Controller: {controller.get_name()}")
@@ -247,6 +238,25 @@ def main(argv=None):
                 if not last_not_ready_message:
                     print("Firmware is not armed: configure SSI pins and calibration before motion.")
                     last_not_ready_message = True
+
+            screen.fill((30, 30, 30))
+
+            status_text = "ARMED (LIVE)" if (controller_ready and ik_ready) else "DISARMED / FAULT"
+            status_color = (50, 255, 50) if status_text == "ARMED (LIVE)" else (255, 50, 50)
+            screen.blit(font.render(f"Status: {status_text}", True, status_color), (20, 20))
+
+            if target_pose is not None:
+                x_mm = target_pose[0, 3] * 1000
+                y_mm = target_pose[1, 3] * 1000
+                z_mm = target_pose[2, 3] * 1000
+
+                screen.blit(font.render(f"Target X: {x_mm:>8.2f} mm", True, (255, 255, 255)), (20, 80))
+                screen.blit(font.render(f"Target Y: {y_mm:>8.2f} mm", True, (255, 255, 255)), (20, 115))
+                screen.blit(font.render(f"Target Z: {z_mm:>8.2f} mm", True, (255, 255, 255)), (20, 150))
+            else:
+                screen.blit(font.render("Target XYZ: Waiting for Telemetry...", True, (150, 150, 150)), (20, 80))
+
+            pygame.display.flip()
 
     except KeyboardInterrupt:
         pass
