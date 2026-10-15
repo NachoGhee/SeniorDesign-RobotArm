@@ -9,7 +9,7 @@
             "name": "PlatformIO",
             "includePath": [
                 "C:/Users/CheeA/Documents/GitHub/SeniorDesign-RobotArm/ESP32-S4/ESP32-S3-N8R2 Main",
-                "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/SPI/src",
+                "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/Wire/src",
                 "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/newlib/platform_include",
                 "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/freertos/include",
                 "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/freertos/include/esp_additions/freertos",
@@ -206,7 +206,7 @@
                 "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/espressif__esp-dsp/modules/kalman/ekf/include",
                 "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/espressif__esp-dsp/modules/kalman/ekf_imu13states/include",
                 "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/fb_gfx/include",
-                "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/qio_opi/include",
+                "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/qio_qspi/include",
                 "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/cores/esp32",
                 "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/variants/esp32s3",
                 "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/ArduinoOTA/src",
@@ -231,6 +231,7 @@
                 "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/RainMaker/src",
                 "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/SD/src",
                 "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/SD_MMC/src",
+                "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/SPI/src",
                 "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/SPIFFS/src",
                 "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/SimpleBLE/src",
                 "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/Ticker/src",
@@ -240,14 +241,13 @@
                 "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src",
                 "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/WiFiClientSecure/src",
                 "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/WiFiProv/src",
-                "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/Wire/src",
                 ""
             ],
             "browse": {
                 "limitSymbolsToIncludedHeaders": true,
                 "path": [
                     "C:/Users/CheeA/Documents/GitHub/SeniorDesign-RobotArm/ESP32-S4/ESP32-S3-N8R2 Main",
-                    "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/SPI/src",
+                    "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/Wire/src",
                     "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/newlib/platform_include",
                     "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/freertos/include",
                     "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/freertos/include/esp_additions/freertos",
@@ -444,7 +444,7 @@
                     "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/espressif__esp-dsp/modules/kalman/ekf/include",
                     "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/espressif__esp-dsp/modules/kalman/ekf_imu13states/include",
                     "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/fb_gfx/include",
-                    "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/qio_opi/include",
+                    "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/qio_qspi/include",
                     "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/cores/esp32",
                     "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/variants/esp32s3",
                     "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/ArduinoOTA/src",
@@ -469,6 +469,7 @@
                     "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/RainMaker/src",
                     "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/SD/src",
                     "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/SD_MMC/src",
+                    "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/SPI/src",
                     "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/SPIFFS/src",
                     "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/SimpleBLE/src",
                     "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/Ticker/src",
@@ -478,7 +479,6 @@
                     "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src",
                     "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/WiFiClientSecure/src",
                     "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/WiFiProv/src",
-                    "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/Wire/src",
                     ""
                 ]
             },
@@ -502,7 +502,7 @@
                 "ARDUINO=10812",
                 "ARDUINO_VARIANT=\"esp32s3\"",
                 "ARDUINO_BOARD=\"Espressif ESP32-S3-DevKitC-1-N8 (8 MB QD, No PSRAM)\"",
-                "ARDUINO_PARTITION_default_16MB",
+                "ARDUINO_PARTITION_default_8MB",
                 ""
             ],
             "cStandard": "gnu99",

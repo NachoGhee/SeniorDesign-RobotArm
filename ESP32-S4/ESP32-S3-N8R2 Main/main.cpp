@@ -20,11 +20,11 @@ constexpr float MAX_STEP_RATE = 10000.0f;
 constexpr uint32_t STEPPER_TASK_STACK_BYTES = 4096;
 constexpr UBaseType_t STEPPER_TASK_PRIORITY = 3;
 constexpr BaseType_t STEPPER_TASK_CORE = 0;
-constexpr bool BENCH_TEST_MODE = false;
+constexpr bool BENCH_TEST_MODE = true;
 // Bit N enables motor channel N for bench commands; only enabled channels need pins.
 constexpr uint8_t BENCH_MOTOR_MASK = 0x01;
 // Bit N enables encoder channel N; use zero when testing motors without encoders.
-constexpr uint8_t BENCH_ENCODER_MASK = 0x00;
+constexpr uint8_t BENCH_ENCODER_MASK = 0x08;
 constexpr long BENCH_MAX_STEPS_PER_SECOND = 200;
 constexpr uint32_t BENCH_MAX_DURATION_MS = 1000;
 constexpr uint8_t J4_INDEX = 3;
@@ -130,6 +130,13 @@ bool motorChannelConfigured(uint8_t index) {
 bool encoderChannelConfigured(uint8_t index) {
     return index < JOINT_COUNT &&
            (!BENCH_TEST_MODE || (BENCH_ENCODER_MASK & (1U << index)) != 0);
+}
+
+bool muxEncoderConfigured() {
+    for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
+        if (i != J4_INDEX && encoderChannelConfigured(i)) return true;
+    }
+    return false;
 }
 
 bool encoderPinsReady() {
@@ -881,9 +888,33 @@ void updateMotorOutputs() {
 }
 
 void stepperTask(void *) {
+    uint32_t lastYieldMs = millis();
     for (;;) {
         updateMotorOutputs();
-        delayMicroseconds(1);
+        
+        // Check if any motor is actively commanded to move
+        bool activelyMoving = false;
+        for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+            if (fabsf(motors[i].stepsPerSecond) >= 1.0f) {
+                activelyMoving = true;
+                break;
+            }
+        }
+
+        if (activelyMoving) {
+            // Need tight microsecond precision for smooth stepper pulsing
+            delayMicroseconds(1); 
+            
+            // Briefly yield to the RTOS every 2 seconds to prevent a Watchdog panic during very long movements
+            if (millis() - lastYieldMs > 2000) {
+                vTaskDelay(1);
+                lastYieldMs = millis();
+            }
+        } else {
+            // When motors are stopped, yield to the RTOS constantly to feed the Watchdog
+            vTaskDelay(1); 
+            lastYieldMs = millis();
+        }
     }
 }
 
@@ -911,12 +942,16 @@ void setup() {
         if (digitalRead(EMERGENCY_STOP_PIN) == LOW) emergencyStopISR();
     }
     if (encoderPinsReady() && (!BENCH_TEST_MODE || BENCH_ENCODER_MASK != 0)) {
-        Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-        Wire.setClock(400000);
-        Wire.beginTransmission(TCA9548A_ADDRESS);
-        Wire.write(static_cast<uint8_t>(0));
-        const bool muxResponded = Wire.endTransmission() == 0;
-        encoderHardwareReady = muxResponded && initAmt103Pcnt();
+        bool muxReady = true;
+        if (muxEncoderConfigured()) {
+            Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+            Wire.setClock(400000);
+            Wire.beginTransmission(TCA9548A_ADDRESS);
+            Wire.write(static_cast<uint8_t>(0));
+            muxReady = Wire.endTransmission() == 0;
+        }
+        const bool pcntReady = !encoderChannelConfigured(J4_INDEX) || initAmt103Pcnt();
+        encoderHardwareReady = muxReady && pcntReady;
         if (!encoderHardwareReady) Serial.println("ERR,ENCODER_INIT");
     }
     disableDrivers();
