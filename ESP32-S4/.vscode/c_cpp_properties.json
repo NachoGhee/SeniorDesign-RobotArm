@@ -8,7 +8,7 @@
         {
             "name": "PlatformIO",
             "includePath": [
-                "C:/Users/CheeA/Documents/GitHub/SeniorDesign-RobotArm/ESP32-S4/ESP32-S4 Main",
+                "C:/Users/CheeA/Documents/GitHub/SeniorDesign-RobotArm/ESP32-S4/ESP32-S3-N8R2 Main",
                 "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/SPI/src",
                 "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/newlib/platform_include",
                 "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/freertos/include",
@@ -246,7 +246,7 @@
             "browse": {
                 "limitSymbolsToIncludedHeaders": true,
                 "path": [
-                    "C:/Users/CheeA/Documents/GitHub/SeniorDesign-RobotArm/ESP32-S4/ESP32-S4 Main",
+                    "C:/Users/CheeA/Documents/GitHub/SeniorDesign-RobotArm/ESP32-S4/ESP32-S3-N8R2 Main",
                     "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/libraries/SPI/src",
                     "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/newlib/platform_include",
                     "C:/Users/CheeA/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s3/include/freertos/include",

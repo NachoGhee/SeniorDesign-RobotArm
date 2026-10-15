@@ -1,5 +1,6 @@
 #include <Arduino.h>
-#include <SPI.h>
+#include <Wire.h>
+#include <driver/pcnt.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,7 +12,6 @@
 constexpr uint8_t JOINT_COUNT = 6;
 constexpr uint8_t MOTOR_COUNT = 7;
 constexpr uint32_t SERIAL_BAUD = 115200;
-constexpr uint32_t SSI_CLOCK_HZ = 500000;
 constexpr uint32_t COMMAND_TIMEOUT_MS = 500;
 constexpr uint32_t SENSOR_PERIOD_US = 5000;
 constexpr uint32_t TELEMETRY_PERIOD_MS = 100;
@@ -27,19 +27,32 @@ constexpr uint8_t BENCH_MOTOR_MASK = 0x01;
 constexpr uint8_t BENCH_ENCODER_MASK = 0x00;
 constexpr long BENCH_MAX_STEPS_PER_SECOND = 200;
 constexpr uint32_t BENCH_MAX_DURATION_MS = 1000;
+constexpr uint8_t J4_INDEX = 3;
+constexpr uint8_t TCA9548A_ADDRESS = 0x70;
+constexpr uint8_t MT6701_I2C_ADDRESS = 0x06;
+constexpr uint8_t MT6701_ANGLE_REGISTER = 0x03;
+constexpr uint8_t NO_MUX_CHANNEL = 0xFF;
+constexpr uint8_t MT6701_MUX_CHANNEL[JOINT_COUNT] = {0, 1, 2, NO_MUX_CHANNEL, 3, 4};
+constexpr int8_t I2C_SDA_PIN = 1;
+constexpr int8_t I2C_SCL_PIN = 2;
+constexpr int8_t AMT103_A_PIN = 21;
+constexpr int8_t AMT103_B_PIN = 38;
+constexpr int32_t AMT103_PPR = 2048;
+constexpr int32_t AMT103_QUADRATURE_FACTOR = 4;
+constexpr float J4_GEAR_RATIO = 100.0f;
+constexpr int16_t PCNT_HIGH_LIMIT = 30000;
+constexpr int16_t PCNT_LOW_LIMIT = -30000;
+constexpr uint16_t PCNT_FILTER_CYCLES = 10;
 static_assert(BENCH_MOTOR_MASK != 0 && (BENCH_MOTOR_MASK & ~0x7F) == 0,
               "Bench mode requires a valid motor channel mask");
 static_assert((BENCH_ENCODER_MASK & ~0x3F) == 0,
               "Bench encoder mask contains an invalid channel");
 
-// Set these GPIOs from the final ESP32-S3 board pinout.
-const int8_t SSI_CLK_PIN = -1;
-const int8_t SSI_DO_PIN = -1;
-const int8_t ENCODER_CSN_PINS[JOINT_COUNT] = {-1, -1, -1, -1, -1, -1};
+// Motor order: DM556 channels 1-4, then TMC2209 X/Y/Z.
+const int8_t STEP_PINS[MOTOR_COUNT] = {4, 6, 15, 17, 8, 10, 12};
+const int8_t DIR_PINS[MOTOR_COUNT] = {5, 7, 16, 18, 9, 11, 13};
+const int8_t ENABLE_PINS[MOTOR_COUNT] = {-1, -1, -1, -1, 14, 14, 14};
 const int8_t EMERGENCY_STOP_PIN = -1;
-const int8_t STEP_PINS[MOTOR_COUNT] = {-1, -1, -1, -1, -1, -1, -1};
-const int8_t DIR_PINS[MOTOR_COUNT] = {-1, -1, -1, -1, -1, -1, -1};
-const int8_t ENABLE_PINS[MOTOR_COUNT] = {-1, -1, -1, -1, -1, -1, -1};
 
 // Motor indexes 1 and 2 are the two J2 motors. The second is mechanically reversed.
 const uint8_t MOTOR_JOINT[MOTOR_COUNT] = {0, 1, 1, 2, 3, 4, 5};
@@ -47,10 +60,11 @@ const int8_t MOTOR_DIRECTION_SIGN[MOTOR_COUNT] = {1, 1, -1, 1, 1, 1, 1};
 const uint8_t MOTOR_DIR_POSITIVE_LEVEL[MOTOR_COUNT] = {HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH};
 const uint8_t DRIVER_ENABLE_ACTIVE_LEVEL[MOTOR_COUNT] = {LOW, LOW, LOW, LOW, LOW, LOW, LOW};
 
-// Tie each MT6701 MODE pin high for I2C/SSI. Confirm this physically before enabling reads.
-volatile bool SSI_MODE_CONFIRMED = false;
+volatile bool I2C_MODE_CONFIRMED = false;
 volatile bool CALIBRATION_COMPLETE = false;
 volatile bool MOTION_ENABLED = false;
+volatile bool encoderHardwareReady = false;
+volatile bool j4Zeroed = false;
 
 const float ENCODER_ZERO_DEG[JOINT_COUNT] = {0, 0, 0, 0, 0, 0};
 const int8_t ENCODER_DIRECTION_SIGN[JOINT_COUNT] = {1, 1, 1, 1, 1, 1};
@@ -100,6 +114,9 @@ uint32_t emergencyDisableClearHigh = 0;
 bool stopServiced = false;
 char serialBuffer[160];
 size_t serialLength = 0;
+volatile int64_t amt103OverflowCount = 0;
+int64_t j4ZeroCount = 0;
+portMUX_TYPE amt103CountMux = portMUX_INITIALIZER_UNLOCKED;
 
 bool validPin(int8_t pin) {
     return pin >= 0 && pin <= 48 && pin != 0 && pin != 3 && pin != 45 && pin != 46;
@@ -116,19 +133,12 @@ bool encoderChannelConfigured(uint8_t index) {
 }
 
 bool encoderPinsReady() {
-    bool anyConfigured = false;
+    if (!validPin(I2C_SDA_PIN) || !validPin(I2C_SCL_PIN) || I2C_SDA_PIN == I2C_SCL_PIN ||
+        !validPin(AMT103_A_PIN) || !validPin(AMT103_B_PIN) || AMT103_A_PIN == AMT103_B_PIN) return false;
+    if (BENCH_TEST_MODE && BENCH_ENCODER_MASK == 0) return true;
     for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
-        if (encoderChannelConfigured(i)) anyConfigured = true;
-    }
-    if (!anyConfigured) return BENCH_TEST_MODE;
-    if (!validPin(SSI_CLK_PIN) || !validPin(SSI_DO_PIN) || SSI_CLK_PIN == SSI_DO_PIN) return false;
-    for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
-        if (!encoderChannelConfigured(i)) continue;
-        if (!validPin(ENCODER_CSN_PINS[i]) || ENCODER_CSN_PINS[i] == SSI_CLK_PIN ||
-            ENCODER_CSN_PINS[i] == SSI_DO_PIN) return false;
-        for (uint8_t j = 0; j < i; ++j) {
-            if (encoderChannelConfigured(j) && ENCODER_CSN_PINS[i] == ENCODER_CSN_PINS[j]) return false;
-        }
+        if (!encoderChannelConfigured(i) || i == J4_INDEX) continue;
+        if (MT6701_MUX_CHANNEL[i] >= 8) return false;
     }
     return true;
 }
@@ -137,15 +147,18 @@ bool motorPinsReady() {
     if (BENCH_TEST_MODE && BENCH_MOTOR_MASK == 0) return false;
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
         if (!motorChannelConfigured(i)) continue;
-        if (!validPin(STEP_PINS[i]) || !validPin(DIR_PINS[i]) || !validPin(ENABLE_PINS[i]) ||
-            STEP_PINS[i] == DIR_PINS[i] || STEP_PINS[i] == ENABLE_PINS[i] || DIR_PINS[i] == ENABLE_PINS[i]) return false;
+        if (!validPin(STEP_PINS[i]) || !validPin(DIR_PINS[i]) ||
+            (ENABLE_PINS[i] != -1 && !validPin(ENABLE_PINS[i])) ||
+            STEP_PINS[i] == DIR_PINS[i] ||
+            (ENABLE_PINS[i] >= 0 && (STEP_PINS[i] == ENABLE_PINS[i] || DIR_PINS[i] == ENABLE_PINS[i]))) return false;
         for (uint8_t j = 0; j < i; ++j) {
             if (!motorChannelConfigured(j)) continue;
             if (STEP_PINS[i] == STEP_PINS[j] || STEP_PINS[i] == DIR_PINS[j] ||
-                STEP_PINS[i] == ENABLE_PINS[j] || DIR_PINS[i] == STEP_PINS[j] ||
-                DIR_PINS[i] == DIR_PINS[j] || DIR_PINS[i] == ENABLE_PINS[j] ||
-                ENABLE_PINS[i] == STEP_PINS[j] || ENABLE_PINS[i] == DIR_PINS[j] ||
-                ENABLE_PINS[i] == ENABLE_PINS[j]) return false;
+                (ENABLE_PINS[j] >= 0 && STEP_PINS[i] == ENABLE_PINS[j]) ||
+                DIR_PINS[i] == STEP_PINS[j] || DIR_PINS[i] == DIR_PINS[j] ||
+                (ENABLE_PINS[j] >= 0 && DIR_PINS[i] == ENABLE_PINS[j]) ||
+                (ENABLE_PINS[i] >= 0 && (ENABLE_PINS[i] == STEP_PINS[j] ||
+                                          ENABLE_PINS[i] == DIR_PINS[j]))) return false;
         }
     }
     return true;
@@ -153,7 +166,7 @@ bool motorPinsReady() {
 
 bool benchConfigReady() {
     if (!BENCH_TEST_MODE || !motorPinsReady() || !validPin(EMERGENCY_STOP_PIN)) return false;
-    if (BENCH_ENCODER_MASK != 0 && (!encoderPinsReady() || !SSI_MODE_CONFIRMED)) return false;
+    if (BENCH_ENCODER_MASK != 0 && (!encoderPinsReady() || !I2C_MODE_CONFIRMED)) return false;
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
         if (!motorChannelConfigured(i)) continue;
         if (EMERGENCY_STOP_PIN == STEP_PINS[i] || EMERGENCY_STOP_PIN == DIR_PINS[i] ||
@@ -176,7 +189,7 @@ bool calibrationValuesReady() {
 }
 
 bool motionConfigReady() {
-    return SSI_MODE_CONFIRMED && CALIBRATION_COMPLETE && encoderPinsReady() &&
+    return I2C_MODE_CONFIRMED && encoderHardwareReady && j4Zeroed && CALIBRATION_COMPLETE && encoderPinsReady() &&
            motorPinsReady() && calibrationValuesReady() && stepperTaskReady;
 }
 
@@ -202,7 +215,8 @@ void disableDrivers() {
 
 void enableDrivers() {
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
-        if (motorChannelConfigured(i) && (!BENCH_TEST_MODE || i == benchMotorIndex)) {
+        if (motorChannelConfigured(i) && validPin(ENABLE_PINS[i]) &&
+            (!BENCH_TEST_MODE || i == benchMotorIndex)) {
             digitalWrite(ENABLE_PINS[i], DRIVER_ENABLE_ACTIVE_LEVEL[i]);
         }
     }
@@ -239,45 +253,126 @@ void prepareEmergencyDisableMasks() {
     }
 }
 
-uint8_t calculateCrc6(uint32_t data18) {
-    uint8_t crc = 0;
-    for (int8_t bit = 17; bit >= 0; --bit) {
-        const bool feedback = ((crc >> 5) & 1U) ^ ((data18 >> bit) & 1U);
-        crc = (crc << 1) & 0x3F;
-        if (feedback) crc ^= 0x03;
-    }
-    return crc;
+void IRAM_ATTR amt103PcntIsr(void *) {
+    uint32_t eventStatus = 0;
+    pcnt_get_event_status(PCNT_UNIT_0, &eventStatus);
+    portENTER_CRITICAL_ISR(&amt103CountMux);
+    if (eventStatus & PCNT_EVT_H_LIM) amt103OverflowCount += PCNT_HIGH_LIMIT;
+    if (eventStatus & PCNT_EVT_L_LIM) amt103OverflowCount += PCNT_LOW_LIMIT;
+    portEXIT_CRITICAL_ISR(&amt103CountMux);
 }
 
-bool readEncoder(uint8_t index) {
-    if (!encoderChannelConfigured(index) || !encoderPinsReady()) return false;
-    SPI.beginTransaction(SPISettings(SSI_CLOCK_HZ, MSBFIRST, SPI_MODE2));
-    digitalWrite(ENCODER_CSN_PINS[index], LOW);
-    delayMicroseconds(1);
-    uint32_t frame = static_cast<uint32_t>(SPI.transfer(0)) << 16;
-    frame |= static_cast<uint32_t>(SPI.transfer(0)) << 8;
-    frame |= SPI.transfer(0);
-    digitalWrite(ENCODER_CSN_PINS[index], HIGH);
-    SPI.endTransaction();
+bool initAmt103Pcnt() {
+    pinMode(AMT103_A_PIN, INPUT);
+    pinMode(AMT103_B_PIN, INPUT);
+    const pcnt_config_t channelA = {
+        .pulse_gpio_num = AMT103_A_PIN,
+        .ctrl_gpio_num = AMT103_B_PIN,
+        .lctrl_mode = PCNT_MODE_REVERSE,
+        .hctrl_mode = PCNT_MODE_KEEP,
+        .pos_mode = PCNT_COUNT_INC,
+        .neg_mode = PCNT_COUNT_DEC,
+        .counter_h_lim = PCNT_HIGH_LIMIT,
+        .counter_l_lim = PCNT_LOW_LIMIT,
+        .unit = PCNT_UNIT_0,
+        .channel = PCNT_CHANNEL_0,
+    };
+    const pcnt_config_t channelB = {
+        .pulse_gpio_num = AMT103_B_PIN,
+        .ctrl_gpio_num = AMT103_A_PIN,
+        .lctrl_mode = PCNT_MODE_KEEP,
+        .hctrl_mode = PCNT_MODE_REVERSE,
+        .pos_mode = PCNT_COUNT_DEC,
+        .neg_mode = PCNT_COUNT_INC,
+        .counter_h_lim = PCNT_HIGH_LIMIT,
+        .counter_l_lim = PCNT_LOW_LIMIT,
+        .unit = PCNT_UNIT_0,
+        .channel = PCNT_CHANNEL_1,
+    };
+    if (pcnt_unit_config(&channelA) != ESP_OK || pcnt_unit_config(&channelB) != ESP_OK ||
+        pcnt_set_filter_value(PCNT_UNIT_0, PCNT_FILTER_CYCLES) != ESP_OK ||
+        pcnt_filter_enable(PCNT_UNIT_0) != ESP_OK ||
+        pcnt_event_enable(PCNT_UNIT_0, PCNT_EVT_H_LIM) != ESP_OK ||
+        pcnt_event_enable(PCNT_UNIT_0, PCNT_EVT_L_LIM) != ESP_OK ||
+        pcnt_isr_service_install(0) != ESP_OK ||
+        pcnt_isr_handler_add(PCNT_UNIT_0, amt103PcntIsr, nullptr) != ESP_OK ||
+        pcnt_counter_clear(PCNT_UNIT_0) != ESP_OK ||
+        pcnt_counter_resume(PCNT_UNIT_0) != ESP_OK) return false;
+    return true;
+}
 
-    const uint32_t data18 = frame >> 6;
-    const uint8_t receivedCrc = frame & 0x3F;
-    const uint8_t status = (frame >> 6) & 0x0F;
-    encoders[index].rawAngle = (frame >> 10) & 0x3FFF;
-    encoders[index].magneticStatus = status;
-    encoders[index].valid = receivedCrc == calculateCrc6(data18) &&
-                            (status & 0x03) == 0 && (status & 0x08) == 0;
-    if (!encoders[index].valid) {
+bool selectMuxChannel(uint8_t channel) {
+    if (channel >= 8) return false;
+    Wire.beginTransmission(TCA9548A_ADDRESS);
+    Wire.write(static_cast<uint8_t>(1U << channel));
+    return Wire.endTransmission() == 0;
+}
+
+bool readMt6701(uint8_t index) {
+    if (!encoderChannelConfigured(index) || index == J4_INDEX ||
+        !selectMuxChannel(MT6701_MUX_CHANNEL[index])) {
+        if (index < JOINT_COUNT) {
+            encoders[index].valid = false;
+            encoders[index].angleDeg = NAN;
+        }
+        return false;
+    }
+    Wire.beginTransmission(MT6701_I2C_ADDRESS);
+    Wire.write(MT6701_ANGLE_REGISTER);
+    if (Wire.endTransmission(false) != 0 ||
+        Wire.requestFrom(static_cast<uint8_t>(MT6701_I2C_ADDRESS), static_cast<uint8_t>(2)) != 2) {
+        encoders[index].valid = false;
         encoders[index].angleDeg = NAN;
         return false;
     }
 
+    const uint16_t high = Wire.read();
+    const uint16_t low = Wire.read();
+    encoders[index].rawAngle = ((high << 6) | (low >> 2)) & 0x3FFF;
+    encoders[index].magneticStatus = 0;
+    encoders[index].valid = true;
     const float rawDegrees = encoders[index].rawAngle * (360.0f / 16384.0f);
     float corrected = (rawDegrees - ENCODER_ZERO_DEG[index]) * ENCODER_DIRECTION_SIGN[index];
     while (corrected < 0) corrected += 360.0f;
     while (corrected >= 360.0f) corrected -= 360.0f;
     encoders[index].angleDeg = corrected;
     return true;
+}
+
+bool getAmt103Count(int64_t *count) {
+    int16_t hardwareCount = 0;
+    portENTER_CRITICAL(&amt103CountMux);
+    const esp_err_t result = pcnt_get_counter_value(PCNT_UNIT_0, &hardwareCount);
+    if (result != ESP_OK) {
+        portEXIT_CRITICAL(&amt103CountMux);
+        return false;
+    }
+    *count = amt103OverflowCount + hardwareCount;
+    portEXIT_CRITICAL(&amt103CountMux);
+    return true;
+}
+
+bool readAmt103() {
+    if (!j4Zeroed) {
+        encoders[J4_INDEX].angleDeg = NAN;
+        encoders[J4_INDEX].valid = false;
+        return false;
+    }
+    int64_t count = 0;
+    if (!getAmt103Count(&count)) return false;
+    encoders[J4_INDEX].rawAngle = 0;
+    encoders[J4_INDEX].magneticStatus = 0;
+    encoders[J4_INDEX].valid = true;
+    encoders[J4_INDEX].angleDeg = static_cast<float>(count - j4ZeroCount) *
+                                  (360.0f / (AMT103_PPR * AMT103_QUADRATURE_FACTOR * J4_GEAR_RATIO)) *
+                                  ENCODER_DIRECTION_SIGN[J4_INDEX];
+    return true;
+}
+
+bool readEncoder(uint8_t index) {
+    if (!encoderChannelConfigured(index) || !encoderPinsReady() || !encoderHardwareReady) return false;
+    if (index == J4_INDEX) return readAmt103();
+    return readMt6701(index);
 }
 
 void readAllEncoders() {
@@ -324,6 +419,22 @@ void sendTelemetry() {
 }
 
 bool processSetupCommand(char *line) {
+    if (strcmp(line, "ZERO_J4") == 0) {
+        if (MOTION_ENABLED || driversEnabled || !encoderHardwareReady) {
+            Serial.println("ERR,J4_ZERO_STATE");
+            return true;
+        }
+        int64_t count = 0;
+        if (!getAmt103Count(&count)) {
+            Serial.println("ERR,J4_COUNTER");
+            return true;
+        }
+        j4ZeroCount = count;
+        j4Zeroed = true;
+        readAmt103();
+        Serial.println("OK,J4_ZEROED");
+        return true;
+    }
     if (strncmp(line, "BENCH,", 6) == 0) {
         if (!BENCH_TEST_MODE) {
             Serial.println("ERR,BENCH_DISABLED");
@@ -423,12 +534,12 @@ bool processSetupCommand(char *line) {
         return true;
     }
     const bool enabled = value[0] == '1';
-    if (strcmp(setting, "SSI") == 0) {
-        if (enabled && (!encoderPinsReady() || !allEncodersValid())) {
-            Serial.println("ERR,SSI_NOT_VERIFIED");
+    if (strcmp(setting, "I2C") == 0) {
+        if (enabled && (!encoderPinsReady() || !encoderHardwareReady || !allEncodersValid())) {
+            Serial.println("ERR,I2C_NOT_VERIFIED");
             return true;
         }
-        SSI_MODE_CONFIRMED = enabled;
+        I2C_MODE_CONFIRMED = enabled;
     } else if (strcmp(setting, "CAL") == 0) {
         if (enabled && (!motorPinsReady() || !calibrationValuesReady())) {
             Serial.println("ERR,CALIBRATION_VALUES");
@@ -733,12 +844,13 @@ void setup() {
         if (digitalRead(EMERGENCY_STOP_PIN) == LOW) emergencyStopISR();
     }
     if (encoderPinsReady() && (!BENCH_TEST_MODE || BENCH_ENCODER_MASK != 0)) {
-        for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
-            if (!encoderChannelConfigured(i)) continue;
-            pinMode(ENCODER_CSN_PINS[i], OUTPUT);
-            digitalWrite(ENCODER_CSN_PINS[i], HIGH);
-        }
-        SPI.begin(SSI_CLK_PIN, SSI_DO_PIN, -1);
+        Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+        Wire.setClock(400000);
+        Wire.beginTransmission(TCA9548A_ADDRESS);
+        Wire.write(static_cast<uint8_t>(0));
+        const bool muxResponded = Wire.endTransmission() == 0;
+        encoderHardwareReady = muxResponded && initAmt103Pcnt();
+        if (!encoderHardwareReady) Serial.println("ERR,ENCODER_INIT");
     }
     disableDrivers();
     stepperTaskReady = xTaskCreatePinnedToCore(stepperTask, "stepper", STEPPER_TASK_STACK_BYTES, nullptr,
@@ -747,7 +859,7 @@ void setup() {
     if (BENCH_TEST_MODE) {
         Serial.println("BENCH mode: BENCH,<channel 0-6>,<signed steps/s>,<duration ms>; DISARM stops.");
     } else {
-        Serial.println("POSE ready; send CFG,SSI,1 and CFG,CAL,1 after verification, then ARM.");
+        Serial.println("POSE ready; align J4, ZERO_J4, verify encoders, CFG,I2C,1, CFG,CAL,1, ARM.");
     }
 }
 
@@ -769,7 +881,7 @@ void loop() {
         Serial.println("FAULT,HARDWARE_ESTOP");
     }
     const uint32_t now = micros();
-    if ((!BENCH_TEST_MODE || BENCH_ENCODER_MASK != 0) && encoderPinsReady() &&
+    if ((!BENCH_TEST_MODE || BENCH_ENCODER_MASK != 0) && encoderPinsReady() && encoderHardwareReady &&
         static_cast<uint32_t>(now - lastSensorUs) >= SENSOR_PERIOD_US) {
         lastSensorUs = now;
         readAllEncoders();
