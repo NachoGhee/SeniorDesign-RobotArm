@@ -418,7 +418,74 @@ void sendTelemetry() {
     Serial.println();
 }
 
+void testAndDisplayEncoders() {
+    Serial.println("\n=== POSE ROBOT ARM ENCODER SCAN ===");
+
+    if (!encoderPinsReady()) {
+        Serial.println("[FAIL] Encoder pins are not configured correctly.");
+        Serial.println("==================================\n");
+        return;
+    }
+    if (!encoderHardwareReady) {
+        Serial.println("[FAIL] Encoder hardware initialization failed; check mux and PCNT wiring.");
+        Serial.println("==================================\n");
+        return;
+    }
+
+    uint8_t failedCount = 0;
+    uint8_t passedCount = 0;
+    for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
+        if (!encoderChannelConfigured(i)) {
+            Serial.printf("[SKIP] Joint %u: encoder disabled by bench mask\n", i);
+            continue;
+        }
+        if (i == J4_INDEX) {
+            int64_t count = 0;
+            if (getAmt103Count(&count)) {
+                ++passedCount;
+                Serial.printf("[OK] Joint %u (J4): PCNT readable, count=%lld, GPIO%u/GPIO%u\n",
+                              i, static_cast<long long>(count), AMT103_A_PIN, AMT103_B_PIN);
+            } else {
+                ++failedCount;
+                encoders[i].valid = false;
+                encoders[i].angleDeg = NAN;
+                Serial.printf("[FAIL] Joint %u (J4): PCNT read failed\n", i);
+            }
+            continue;
+        }
+
+        if (readEncoder(i)) {
+            ++passedCount;
+            Serial.printf("[OK] Joint %u: angle=%8.3f deg, mux channel=%u\n",
+                          i, encoders[i].angleDeg, MT6701_MUX_CHANNEL[i]);
+        } else {
+            ++failedCount;
+            Serial.printf("[FAIL] Joint %u: MT6701 I2C read failed, mux channel=%u\n",
+                          i, MT6701_MUX_CHANNEL[i]);
+        }
+    }
+
+    Serial.println("----------------------------------");
+    Serial.printf("Scan result: %u readable, %u failed\n", passedCount, failedCount);
+    if (failedCount != 0) {
+        Serial.println("Correct the reported hardware issue and scan again; this diagnostic does not set a fault latch.");
+    } else if (!j4Zeroed) {
+        Serial.println("All encoder interfaces responded. Align J4 and send ZERO_J4 before arming.");
+    } else {
+        Serial.println("All enabled encoder interfaces responded. Send CFG,I2C,1 after verification.");
+    }
+    Serial.println("==================================\n");
+}
+
 bool processSetupCommand(char *line) {
+    if (strcmp(line, "SCAN_ENCODERS") == 0) {
+        if (MOTION_ENABLED || driversEnabled) {
+            Serial.println("ERR,SCAN_REQUIRES_DISARMED");
+        } else {
+            testAndDisplayEncoders();
+        }
+        return true;
+    }
     if (strcmp(line, "ZERO_J4") == 0) {
         if (MOTION_ENABLED || driversEnabled || !encoderHardwareReady) {
             Serial.println("ERR,J4_ZERO_STATE");
