@@ -1,18 +1,48 @@
+import argparse
+import os
 import sys
 import time
 
 import pygame
+import numpy as np
 import serial
+import ikgeo_model
 
-SERIAL_PORT = "COM3"
+SERIAL_PORT = os.environ.get("POSE_SERIAL_PORT", "COM3" if os.name == "nt" else "/dev/ttyACM0")
 BAUD_RATE = 115200
 DEADZONE = 0.15
 SEND_PERIOD_S = 0.05
-JOINT_SPEED_DEG_S = [10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
-JOINT_LIMITS_DEG = [(0.0, 360.0)] * 6
-AXIS_TO_JOINT = {0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5}
-AXIS_SIGN = {0: 1, 1: -1, 2: 1, 3: -1, 4: 1, 5: 1}
+# Edit these mappings/speeds to match the Pi's gamepad. Translation is in meters/s.
+CARTESIAN_AXIS_TO_XYZ = {0: 0, 1: 1, 4: 2}
+CARTESIAN_AXIS_SIGN = {0: 1, 1: -1, 4: 1}
+CARTESIAN_SPEED_M_S = [0.10, 0.10, 0.10]
 ESTOP_BUTTON = 1
+JOINT_GCODE_AXES = ("X", "Y", "Z", "A", "B", "C")
+
+
+def format_joint_gcode(angles):
+    words = " ".join(f"{axis}{angle:.3f}" for axis, angle in zip(JOINT_GCODE_AXES, angles))
+    return f"G1 {words}"
+
+
+def apply_deadzone(value):
+    if abs(value) < DEADZONE:
+        return 0.0
+    return (abs(value) - DEADZONE) / (1.0 - DEADZONE) * (1 if value > 0 else -1)
+
+
+def parse_telemetry_line(line):
+    fields = line.split(",")
+    if len(fields) != 16 or fields[0] != "S":
+        return None
+    try:
+        return {
+            "faults": int(fields[2]),
+            "ready": fields[3] == "1",
+            "angles": [float(value) for value in fields[4:10]],
+        }
+    except ValueError:
+        return None
 
 
 def read_telemetry(port, receive_buffer):
@@ -22,47 +52,101 @@ def read_telemetry(port, receive_buffer):
         raw_line, _, remainder = receive_buffer.partition(b"\n")
         receive_buffer[:] = remainder
         line = raw_line.decode("ascii", errors="replace").strip()
-        fields = line.split(",")
-        if len(fields) == 16 and fields[0] == "S":
-            try:
-                latest = {
-                    "faults": int(fields[2]),
-                    "ready": fields[3] == "1",
-                    "angles": [float(value) for value in fields[4:10]],
-                }
-            except ValueError:
-                continue
+        telemetry = parse_telemetry_line(line)
+        if telemetry is not None:
+            latest = telemetry
         elif line.startswith(("ERR,", "FAULT,")):
             print(line)
     return latest
 
 
-def main():
+def send_gcode_line(port, command, receive_buffer, timeout_s=2.0):
+    port.write((command + "\n").encode("ascii"))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        receive_buffer.extend(port.read(port.in_waiting))
+        while b"\n" in receive_buffer:
+            raw_line, _, remainder = receive_buffer.partition(b"\n")
+            receive_buffer[:] = remainder
+            line = raw_line.decode("ascii", errors="replace").strip()
+            telemetry = parse_telemetry_line(line)
+            if telemetry is not None:
+                if telemetry["faults"]:
+                    raise RuntimeError(f"Encoder fault mask: 0x{telemetry['faults']:02X}")
+            elif line == "ok" or line.startswith("OK,"):
+                return
+            elif line.startswith(("ERR,", "FAULT,")):
+                raise RuntimeError(line)
+        time.sleep(0.005)
+    raise TimeoutError(f"Timed out waiting for acknowledgement to: {command}")
+
+
+def run_gcode_stream(port, source):
+    receive_buffer = bytearray()
+    for raw_line in source:
+        command = raw_line.split(";", 1)[0].strip()
+        if not command:
+            continue
+        send_gcode_line(port, command, receive_buffer)
+        print(f"ok: {command}")
+        if command.upper() == "M112":
+            return
+    send_gcode_line(port, "M18", receive_buffer)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="POSE Raspberry Pi serial and joystick controller")
+    parser.add_argument("--port", default=SERIAL_PORT, help="ESP32 serial port; defaults to POSE_SERIAL_PORT or /dev/ttyACM0")
+    parser.add_argument("--gcode-file", help="send a G-code file, or '-' to read G-code from stdin")
+    args = parser.parse_args(argv)
+
+    print(f"Connecting to ESP32 on {args.port} at {BAUD_RATE} baud...")
+    try:
+        port = serial.Serial(args.port, BAUD_RATE, timeout=0)
+    except serial.SerialException as error:
+        print(f"Could not open serial port: {error}")
+        return 1
+
+    if args.gcode_file is not None:
+        source = sys.stdin if args.gcode_file == "-" else None
+        try:
+            if source is None:
+                with open(args.gcode_file, "r", encoding="ascii") as source_file:
+                    run_gcode_stream(port, source_file)
+            else:
+                run_gcode_stream(port, source)
+        except (OSError, RuntimeError, TimeoutError) as error:
+            print(f"G-code stopped: {error}")
+            port.close()
+            return 1
+        port.close()
+        return 0
+
     pygame.init()
     pygame.joystick.init()
     if pygame.joystick.get_count() == 0:
         print("No controller found.")
         pygame.quit()
+        port.close()
         return 1
 
     controller = pygame.joystick.Joystick(0)
     print(f"Controller: {controller.get_name()}")
-    print(f"Connecting to ESP32 on {SERIAL_PORT} at {BAUD_RATE} baud...")
+    model_errors = ikgeo_model.model_configuration_errors()
+    if model_errors:
+        print("Cartesian IK disabled until ikgeo_model.py is configured:")
+        for error in model_errors:
+            print(f"  - {error}")
     print("Keys: S=confirm SSI, C=confirm calibration, A=arm, D=disarm; controller button 1=E-stop.")
 
-    try:
-        port = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0)
-    except serial.SerialException as error:
-        print(f"Could not open serial port: {error}")
-        pygame.quit()
-        return 1
-
-    target_angles = None
-    sequence = 0
+    target_pose = None
+    seed_angles_rad = None
+    ik_ready = not model_errors
     last_send = 0.0
     last_telemetry_time = 0.0
     controller_ready = False
     last_not_ready_message = False
+    last_ik_error_time = 0.0
     receive_buffer = bytearray()
     clock = pygame.time.Clock()
     running = True
@@ -82,10 +166,14 @@ def main():
                 elif event.type == pygame.KEYDOWN and event.key == pygame.K_c:
                     port.write(b"CFG,CAL,1\n")
                 elif event.type == pygame.KEYDOWN and event.key == pygame.K_a:
-                    port.write(b"ARM\n")
+                    if ik_ready:
+                        port.write(b"G90\nM17\n")
+                    else:
+                        print("Arm blocked: configure the POE model and IK-Geo solver first.")
                 elif event.type == pygame.KEYDOWN and event.key == pygame.K_d:
                     port.write(b"DISARM\n")
-                    target_angles = None
+                    target_pose = None
+                    seed_angles_rad = None
                     controller_ready = False
 
             now = time.monotonic()
@@ -94,39 +182,54 @@ def main():
                 last_telemetry_time = now
                 if telemetry["faults"]:
                     print(f"Encoder fault mask: 0x{telemetry['faults']:02X}")
-                    target_angles = None
+                    target_pose = None
+                    seed_angles_rad = None
                     controller_ready = False
                 elif telemetry["ready"] and all(angle >= 0 for angle in telemetry["angles"]):
                     controller_ready = True
                     last_not_ready_message = False
-                    if target_angles is None:
-                        target_angles = telemetry["angles"][:]
-                        print("Controller ready; targets initialized from encoder feedback.")
+                    if target_pose is None and ik_ready:
+                        try:
+                            seed_angles_rad = ikgeo_model.encoder_degrees_to_model_radians(
+                                np.asarray(telemetry["angles"], dtype=float)
+                            )
+                            target_pose = ikgeo_model.forward_camera_pose(seed_angles_rad)
+                            print("Cartesian target initialized from measured camera pose.")
+                        except (ValueError, ikgeo_model.RobotModelNotConfigured) as error:
+                            ik_ready = False
+                            print(f"Cartesian IK disabled: {error}")
                 else:
                     controller_ready = False
-                    target_angles = None
+                    target_pose = None
+                    seed_angles_rad = None
 
             if now - last_telemetry_time > 0.5:
                 controller_ready = False
-                target_angles = None
+                target_pose = None
+                seed_angles_rad = None
 
-            if target_angles is not None and controller_ready:
-                for axis, joint in AXIS_TO_JOINT.items():
+            if target_pose is not None and seed_angles_rad is not None and controller_ready and ik_ready:
+                for axis, coordinate in CARTESIAN_AXIS_TO_XYZ.items():
                     if axis >= controller.get_numaxes():
                         continue
-                    value = controller.get_axis(axis)
-                    if abs(value) < DEADZONE:
-                        value = 0.0
-                    else:
-                        value = (abs(value) - DEADZONE) / (1.0 - DEADZONE) * (1 if value > 0 else -1)
-                    target_angles[joint] += value * AXIS_SIGN.get(axis, 1) * JOINT_SPEED_DEG_S[joint] * dt
-                    lower, upper = JOINT_LIMITS_DEG[joint]
-                    target_angles[joint] = max(lower, min(upper, target_angles[joint]))
+                    value = apply_deadzone(controller.get_axis(axis))
+                    sign = CARTESIAN_AXIS_SIGN.get(axis, 1)
+                    target_pose[coordinate, 3] += value * sign * CARTESIAN_SPEED_M_S[coordinate] * dt
+                    workspace = np.asarray(ikgeo_model.CARTESIAN_WORKSPACE_BOUNDS_M)
+                    target_pose[coordinate, 3] = np.clip(
+                        target_pose[coordinate, 3], workspace[coordinate, 0], workspace[coordinate, 1]
+                    )
 
                 if now - last_send >= SEND_PERIOD_S:
-                    sequence += 1
-                    values = ",".join(f"{angle:.3f}" for angle in target_angles)
-                    port.write(f"G,{sequence},{values}\n".encode("ascii"))
+                    try:
+                        solved_angles_rad = ikgeo_model.solve_camera_pose(target_pose, seed_angles_rad)
+                        joint_targets_deg = ikgeo_model.model_radians_to_encoder_degrees(solved_angles_rad)
+                        port.write((format_joint_gcode(joint_targets_deg) + "\n").encode("ascii"))
+                        seed_angles_rad = solved_angles_rad
+                    except (ValueError, ikgeo_model.RobotModelNotConfigured) as error:
+                        if now - last_ik_error_time >= 1.0:
+                            print(f"IK target rejected: {error}")
+                            last_ik_error_time = now
                     last_send = now
             elif telemetry is not None and not telemetry["ready"]:
                 if not last_not_ready_message:

@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <soc/gpio_struct.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -78,6 +79,7 @@ volatile bool haveTarget = false;
 volatile bool driversEnabled = false;
 volatile bool eStopLatched = false;
 volatile bool stepperTaskReady = false;
+bool gcodeRelativeMode = false;
 uint32_t emergencyDisableSetLow = 0;
 uint32_t emergencyDisableClearLow = 0;
 uint32_t emergencyDisableSetHigh = 0;
@@ -140,7 +142,6 @@ void disableDrivers() {
     driversEnabled = false;
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
         motors[i].stepsPerSecond = 0;
-        if (validPin(STEP_PINS[i])) digitalWrite(STEP_PINS[i], LOW);
         if (validPin(ENABLE_PINS[i])) digitalWrite(ENABLE_PINS[i], !DRIVER_ENABLE_ACTIVE_LEVEL[i]);
     }
 }
@@ -322,7 +323,38 @@ bool processSetupCommand(char *line) {
     return true;
 }
 
-void processCommand(char *line) {
+void acceptJointTarget(const float requested[JOINT_COUNT]) {
+    if (eStopLatched) {
+        Serial.println("ERR,ESTOP");
+        return;
+    }
+    if (!motionConfigReady()) {
+        Serial.println("ERR,NOT_CONFIGURED");
+        return;
+    }
+    if (!MOTION_ENABLED) {
+        Serial.println("ERR,NOT_ARMED");
+        return;
+    }
+    if (!allEncodersValid()) {
+        Serial.println("ERR,ENCODER");
+        return;
+    }
+    for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
+        if (requested[i] < JOINT_MIN_DEG[i] || requested[i] > JOINT_MAX_DEG[i]) {
+            Serial.println("ERR,LIMIT");
+            return;
+        }
+    }
+
+    memcpy(targetDeg, requested, sizeof(targetDeg));
+    haveTarget = true;
+    lastCommandMs = millis();
+    enableDrivers();
+    Serial.println("ok");
+}
+
+void processCsvCommand(char *line) {
     if (strcmp(line, "X") == 0) {
         stopAndLatch("HOST_ESTOP");
         return;
@@ -357,33 +389,114 @@ void processCommand(char *line) {
         Serial.println("ERR,FORMAT");
         return;
     }
-    if (eStopLatched) {
-        Serial.println("ERR,ESTOP");
+    acceptJointTarget(requested);
+}
+
+bool parseGcodeInteger(const char *word, char prefix, int *value) {
+    if (toupper(static_cast<unsigned char>(word[0])) != prefix) return false;
+    char *end = nullptr;
+    const long parsed = strtol(word + 1, &end, 10);
+    if (end == word + 1 || *end != '\0') return false;
+    *value = static_cast<int>(parsed);
+    return true;
+}
+
+void processGcode(char *line) {
+    char *comment = strchr(line, ';');
+    if (comment != nullptr) *comment = '\0';
+    char *save = nullptr;
+    char *word = strtok_r(line, " \t", &save);
+    if (word == nullptr) return;
+
+    const char type = toupper(static_cast<unsigned char>(word[0]));
+    int number = 0;
+    if (!parseGcodeInteger(word, type, &number)) {
+        Serial.println("ERR,GCODE_FORMAT");
         return;
     }
-    if (!motionConfigReady()) {
-        Serial.println("ERR,NOT_CONFIGURED");
+    if (type == 'M') {
+        if (strtok_r(nullptr, " \t", &save) != nullptr) {
+            Serial.println("ERR,GCODE_FORMAT");
+        } else if (number == 17) {
+            char command[] = "ARM";
+            processSetupCommand(command);
+        } else if (number == 18) {
+            char command[] = "DISARM";
+            processSetupCommand(command);
+        } else if (number == 112) {
+            stopAndLatch("GCODE_ESTOP");
+        } else {
+            Serial.println("ERR,GCODE_UNSUPPORTED");
+        }
         return;
     }
-    if (!MOTION_ENABLED) {
-        Serial.println("ERR,NOT_ARMED");
+    if (type != 'G') {
+        Serial.println("ERR,GCODE_UNSUPPORTED");
         return;
     }
-    if (faultMask != 0) {
-        Serial.println("ERR,ENCODER");
-        return;
-    }
-    for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
-        if (!encoders[i].valid || requested[i] < JOINT_MIN_DEG[i] || requested[i] > JOINT_MAX_DEG[i]) {
-            Serial.println("ERR,LIMIT_OR_SENSOR");
+    if (number == 90 || number == 91) {
+        if (strtok_r(nullptr, " \t", &save) != nullptr) {
+            Serial.println("ERR,GCODE_FORMAT");
             return;
         }
+        gcodeRelativeMode = number == 91;
+        Serial.println("ok");
+        return;
+    }
+    if (number != 0 && number != 1) {
+        Serial.println("ERR,GCODE_UNSUPPORTED");
+        return;
     }
 
-    memcpy(targetDeg, requested, sizeof(targetDeg));
-    haveTarget = true;
-    lastCommandMs = millis();
-    enableDrivers();
+    static const char jointAxes[JOINT_COUNT] = {'X', 'Y', 'Z', 'A', 'B', 'C'};
+    float requested[JOINT_COUNT];
+    bool axisSeen[JOINT_COUNT] = {false, false, false, false, false, false};
+    for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
+        requested[i] = haveTarget ? targetDeg[i] : encoders[i].angleDeg;
+    }
+
+    bool hasAxis = false;
+    while ((word = strtok_r(nullptr, " \t", &save)) != nullptr) {
+        const char axis = toupper(static_cast<unsigned char>(word[0]));
+        uint8_t joint = JOINT_COUNT;
+        for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
+            if (axis == jointAxes[i]) joint = i;
+        }
+        if (joint == JOINT_COUNT || axisSeen[joint]) {
+            Serial.println("ERR,GCODE_AXIS");
+            return;
+        }
+        char *end = nullptr;
+        const float value = strtof(word + 1, &end);
+        if (end == word + 1 || *end != '\0' || !isfinite(value)) {
+            Serial.println("ERR,GCODE_VALUE");
+            return;
+        }
+        if (gcodeRelativeMode) requested[joint] += value;
+        else requested[joint] = value;
+        axisSeen[joint] = true;
+        hasAxis = true;
+    }
+    if (!hasAxis) {
+        Serial.println("ERR,GCODE_NO_AXES");
+        return;
+    }
+    ++commandSequence;
+    acceptJointTarget(requested);
+}
+
+void processCommand(char *line) {
+    if (strcmp(line, "X") == 0) {
+        stopAndLatch("HOST_ESTOP");
+        return;
+    }
+    if (processSetupCommand(line)) return;
+    if (line[0] == 'M' || line[0] == 'm' ||
+        ((line[0] == 'G' || line[0] == 'g') && line[1] != ',')) {
+        processGcode(line);
+    } else {
+        processCsvCommand(line);
+    }
 }
 
 void readSerial() {
@@ -518,7 +631,6 @@ void loop() {
         readAllEncoders();
     }
     updatePositionController();
-    updateMotorOutputs();
     if (millis() - lastTelemetryMs >= TELEMETRY_PERIOD_MS) {
         lastTelemetryMs = millis();
         sendTelemetry();
