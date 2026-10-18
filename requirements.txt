@@ -1,3 +1,4 @@
-pygame>=2.5
-pyserial>=3.5
-numpy>=1.26
+﻿ik-geo==1.0.3
+numpy==2.5.4
+pygame==2.6.1
+pyserial==3.5
