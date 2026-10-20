@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import sys
 import time
 
@@ -8,7 +9,7 @@ import numpy as np
 import serial
 import ikgeo_model
 
-SERIAL_PORT = os.environ.get("POSE_SERIAL_PORT", "COM3" if os.name == "nt" else "/dev/ttyACM0")
+SERIAL_PORT = os.environ.get("POSE_SERIAL_PORT", "COM10" if os.name == "nt" else "/dev/ttyACM0")
 BAUD_RATE = 115200
 DEADZONE = 0.15
 SEND_PERIOD_S = 0.05
@@ -31,18 +32,57 @@ def apply_deadzone(value):
     return (abs(value) - DEADZONE) / (1.0 - DEADZONE) * (1 if value > 0 else -1)
 
 
-def parse_telemetry_line(line):
-    fields = line.split(",")
-    if len(fields) != 16 or fields[0] != "S":
-        return None
+def parse_human_readable_telemetry(line):
+    angles = np.full(6, np.nan)
+    if "JE1:" not in line:
+        return angles
     try:
+        encoder_section = line.split("|")[-1].strip()
+        for token in encoder_section.split():
+            if token.startswith("JE") and ":" in token:
+                label, value = token.split(":", 1)
+                joint_idx = int(label[2:]) - 1
+                if 0 <= joint_idx < 6 and value != "NONE":
+                    angles[joint_idx] = float(value)
+    except (IndexError, ValueError):
+        return np.full(6, np.nan)
+    return angles
+
+
+def parse_telemetry_line(line):
+    text = line.strip()
+    if "TEL |" in text or "BENCH_TEL" in text or "JE1:" in text:
+        angles = parse_human_readable_telemetry(text)
+        if np.all(np.isnan(angles)):
+            return None
+
+        faults = 0
+        match = re.search(r"FAULT:0x([0-9A-Fa-f]+)", text)
+        if match:
+            try:
+                faults = int(match.group(1), 16)
+            except ValueError:
+                faults = 0
+
+        ready = "ARMED" in text.upper() or "BENCH_TEL" in text
         return {
-            "faults": int(fields[2]),
-            "ready": fields[3] == "1",
-            "angles": [float(value) for value in fields[4:10]],
+            "faults": faults,
+            "ready": ready,
+            "angles": angles.tolist(),
         }
-    except ValueError:
-        return None
+
+    fields = text.split(",")
+    if len(fields) == 16 and fields[0] == "S":
+        try:
+            return {
+                "faults": int(fields[2]),
+                "ready": fields[3] == "1",
+                "angles": [float(value) for value in fields[4:10]],
+            }
+        except ValueError:
+            return None
+
+    return None
 
 
 def read_telemetry(port, receive_buffer):
@@ -183,6 +223,8 @@ def main(argv=None):
             telemetry = read_telemetry(port, receive_buffer)
             if telemetry is not None:
                 last_telemetry_time = now
+                if len(telemetry["angles"]) > 3 and not np.isnan(telemetry["angles"][3]):
+                    print(f"--> [Bench Debug] Live J4 Angle: {telemetry['angles'][3]:.2f}°")
                 if telemetry["faults"]:
                     print(f"Encoder fault mask: 0x{telemetry['faults']:02X}")
                     target_pose = None

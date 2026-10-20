@@ -1,6 +1,5 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <driver/pcnt.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,7 +21,7 @@ constexpr UBaseType_t STEPPER_TASK_PRIORITY = 3;
 constexpr BaseType_t STEPPER_TASK_CORE = 0;
 constexpr bool BENCH_TEST_MODE = true;
 // Bit N enables motor channel N for bench commands; only enabled channels need pins.
-constexpr uint8_t BENCH_MOTOR_MASK = 0x01;
+constexpr uint8_t BENCH_MOTOR_MASK = 0x11;
 // Bit N enables encoder channel N; use zero when testing motors without encoders.
 constexpr uint8_t BENCH_ENCODER_MASK = 0x08;
 constexpr long BENCH_MAX_STEPS_PER_SECOND = 200;
@@ -37,12 +36,9 @@ constexpr int8_t I2C_SDA_PIN = 1;
 constexpr int8_t I2C_SCL_PIN = 2;
 constexpr int8_t AMT103_A_PIN = 21;
 constexpr int8_t AMT103_B_PIN = 38;
-constexpr int32_t AMT103_PPR = 2048;
+constexpr int32_t AMT103_PPR = 1024;
 constexpr int32_t AMT103_QUADRATURE_FACTOR = 4;
 constexpr float J4_GEAR_RATIO = 1.0f;
-constexpr int16_t PCNT_HIGH_LIMIT = 30000;
-constexpr int16_t PCNT_LOW_LIMIT = -30000;
-constexpr uint16_t PCNT_FILTER_CYCLES = 10;
 static_assert(BENCH_MOTOR_MASK != 0 && (BENCH_MOTOR_MASK & ~0x7F) == 0,
               "Bench mode requires a valid motor channel mask");
 static_assert((BENCH_ENCODER_MASK & ~0x3F) == 0,
@@ -52,7 +48,7 @@ static_assert((BENCH_ENCODER_MASK & ~0x3F) == 0,
 const int8_t STEP_PINS[MOTOR_COUNT] = {4, 6, 15, 17, 8, 10, 12};
 const int8_t DIR_PINS[MOTOR_COUNT] = {5, 7, 16, 18, 9, 11, 13};
 const int8_t ENABLE_PINS[MOTOR_COUNT] = {-1, -1, -1, -1, 14, 14, 14};
-const int8_t EMERGENCY_STOP_PIN = -1;
+const int8_t EMERGENCY_STOP_PIN = 47;
 
 // Motor indexes 1 and 2 are the two J2 motors. The second is mechanically reversed.
 const uint8_t MOTOR_JOINT[MOTOR_COUNT] = {0, 1, 1, 2, 3, 4, 5};
@@ -90,6 +86,7 @@ struct MotorState {
     uint32_t directionReadyUs = 0;
     int8_t direction = 0;
     bool stepHigh = false;
+    volatile int32_t absoluteSteps = 0;
 };
 
 EncoderState encoders[JOINT_COUNT];
@@ -114,7 +111,8 @@ uint32_t emergencyDisableClearHigh = 0;
 bool stopServiced = false;
 char serialBuffer[160];
 size_t serialLength = 0;
-volatile int64_t amt103OverflowCount = 0;
+volatile int64_t hwEncoderCount = 0;
+volatile uint8_t hwEncoderState = 0;
 int64_t j4ZeroCount = 0;
 portMUX_TYPE amt103CountMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -260,51 +258,37 @@ void prepareEmergencyDisableMasks() {
     }
 }
 
-void IRAM_ATTR amt103PcntIsr(void *) {
-    uint32_t eventStatus = 0;
-    pcnt_get_event_status(PCNT_UNIT_0, &eventStatus);
+void IRAM_ATTR amt103SoftwareIsr() {
+    const uint8_t channelA = digitalRead(AMT103_A_PIN);
+    const uint8_t channelB = digitalRead(AMT103_B_PIN);
+    const uint8_t currentState = (channelA << 1) | channelB;
+
     portENTER_CRITICAL_ISR(&amt103CountMux);
-    if (eventStatus & PCNT_EVT_H_LIM) amt103OverflowCount += PCNT_HIGH_LIMIT;
-    if (eventStatus & PCNT_EVT_L_LIM) amt103OverflowCount += PCNT_LOW_LIMIT;
+    const uint8_t transition = (hwEncoderState << 2) | currentState;
+    switch (transition) {
+        case 0b0010:
+        case 0b1011:
+        case 0b1101:
+        case 0b0100:
+            ++hwEncoderCount;
+            break;
+        case 0b0001:
+        case 0b0111:
+        case 0b1110:
+        case 0b1000:
+            --hwEncoderCount;
+            break;
+    }
+    hwEncoderState = currentState;
     portEXIT_CRITICAL_ISR(&amt103CountMux);
 }
 
 bool initAmt103Pcnt() {
     pinMode(AMT103_A_PIN, INPUT);
     pinMode(AMT103_B_PIN, INPUT);
-    const pcnt_config_t channelA = {
-        .pulse_gpio_num = AMT103_A_PIN,
-        .ctrl_gpio_num = AMT103_B_PIN,
-        .lctrl_mode = PCNT_MODE_REVERSE,
-        .hctrl_mode = PCNT_MODE_KEEP,
-        .pos_mode = PCNT_COUNT_INC,
-        .neg_mode = PCNT_COUNT_DEC,
-        .counter_h_lim = PCNT_HIGH_LIMIT,
-        .counter_l_lim = PCNT_LOW_LIMIT,
-        .unit = PCNT_UNIT_0,
-        .channel = PCNT_CHANNEL_0,
-    };
-    const pcnt_config_t channelB = {
-        .pulse_gpio_num = AMT103_B_PIN,
-        .ctrl_gpio_num = AMT103_A_PIN,
-        .lctrl_mode = PCNT_MODE_KEEP,
-        .hctrl_mode = PCNT_MODE_REVERSE,
-        .pos_mode = PCNT_COUNT_DEC,
-        .neg_mode = PCNT_COUNT_INC,
-        .counter_h_lim = PCNT_HIGH_LIMIT,
-        .counter_l_lim = PCNT_LOW_LIMIT,
-        .unit = PCNT_UNIT_0,
-        .channel = PCNT_CHANNEL_1,
-    };
-    if (pcnt_unit_config(&channelA) != ESP_OK || pcnt_unit_config(&channelB) != ESP_OK ||
-        pcnt_set_filter_value(PCNT_UNIT_0, PCNT_FILTER_CYCLES) != ESP_OK ||
-        pcnt_filter_enable(PCNT_UNIT_0) != ESP_OK ||
-        pcnt_event_enable(PCNT_UNIT_0, PCNT_EVT_H_LIM) != ESP_OK ||
-        pcnt_event_enable(PCNT_UNIT_0, PCNT_EVT_L_LIM) != ESP_OK ||
-        pcnt_isr_service_install(0) != ESP_OK ||
-        pcnt_isr_handler_add(PCNT_UNIT_0, amt103PcntIsr, nullptr) != ESP_OK ||
-        pcnt_counter_clear(PCNT_UNIT_0) != ESP_OK ||
-        pcnt_counter_resume(PCNT_UNIT_0) != ESP_OK) return false;
+    hwEncoderState = (digitalRead(AMT103_A_PIN) << 1) | digitalRead(AMT103_B_PIN);
+    attachInterrupt(digitalPinToInterrupt(AMT103_A_PIN), amt103SoftwareIsr, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(AMT103_B_PIN), amt103SoftwareIsr, CHANGE);
     return true;
 }
 
@@ -347,14 +331,8 @@ bool readMt6701(uint8_t index) {
 }
 
 bool getAmt103Count(int64_t *count) {
-    int16_t hardwareCount = 0;
     portENTER_CRITICAL(&amt103CountMux);
-    const esp_err_t result = pcnt_get_counter_value(PCNT_UNIT_0, &hardwareCount);
-    if (result != ESP_OK) {
-        portEXIT_CRITICAL(&amt103CountMux);
-        return false;
-    }
-    *count = amt103OverflowCount + hardwareCount;
+    *count = hwEncoderCount;
     portEXIT_CRITICAL(&amt103CountMux);
     return true;
 }
@@ -407,20 +385,20 @@ void stopAndLatch(const char *reason) {
 }
 
 void sendTelemetry() {
-    Serial.print("S,");
-    Serial.print(commandSequence);
-    Serial.print(',');
-    Serial.print(faultMask);
-    Serial.print(',');
-    Serial.print(motionConfigReady() && MOTION_ENABLED && !eStopLatched && allEncodersValid() ? 1 : 0);
-    for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
-        Serial.print(',');
-        if (isfinite(encoders[i].angleDeg)) Serial.print(encoders[i].angleDeg, 3);
-        else Serial.print(-1);
+    Serial.print("TEL | ");
+    Serial.print((motionConfigReady() && MOTION_ENABLED && !eStopLatched && allEncodersValid()) ? "ARMED | " : "DISARMED | ");
+    Serial.printf("FAULT:0x%02X | ", faultMask);
+
+    for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+        Serial.printf("JM%u:%ld ", i + 1, static_cast<long>(motors[i].absoluteSteps));
     }
+    Serial.print("| ");
     for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
-        Serial.print(',');
-        Serial.print(targetDeg[i], 3);
+        if (isfinite(encoders[i].angleDeg)) {
+            Serial.printf("JE%u:%.2f ", i + 1, encoders[i].angleDeg);
+        } else {
+            Serial.printf("JE%u:NONE ", i + 1);
+        }
     }
     Serial.println();
 }
@@ -450,13 +428,13 @@ void testAndDisplayEncoders() {
             int64_t count = 0;
             if (getAmt103Count(&count)) {
                 ++passedCount;
-                Serial.printf("[OK] Joint %u (J4): PCNT readable, count=%lld, GPIO%u/GPIO%u\n",
+                Serial.printf("[OK] Joint %u (J4): software counter available, count=%lld, GPIO%u/GPIO%u\n",
                               i, static_cast<long long>(count), AMT103_A_PIN, AMT103_B_PIN);
             } else {
                 ++failedCount;
                 encoders[i].valid = false;
                 encoders[i].angleDeg = NAN;
-                Serial.printf("[FAIL] Joint %u (J4): PCNT read failed\n", i);
+                Serial.printf("[FAIL] Joint %u (J4): software counter read failed\n", i);
             }
             continue;
         }
@@ -475,11 +453,11 @@ void testAndDisplayEncoders() {
     Serial.println("----------------------------------");
     Serial.printf("Scan result: %u readable, %u failed\n", passedCount, failedCount);
     if (failedCount != 0) {
-        Serial.println("Correct the reported hardware issue and scan again; this diagnostic does not set a fault latch.");
+        Serial.println("Correct the reported issue and scan again; this diagnostic does not set a fault latch.");
     } else if (!j4Zeroed) {
-        Serial.println("All encoder interfaces responded. Align J4 and send ZERO_J4 before arming.");
+        Serial.println("Interfaces initialized. Rotate J4 to verify counts change; align and send ZERO_J4 before arming.");
     } else {
-        Serial.println("All enabled encoder interfaces responded. Send CFG,I2C,1 after verification.");
+        Serial.println("Interfaces initialized. Rotate J4 to verify counts change; send CFG,I2C,1 after verification.");
     }
     Serial.println("==================================\n");
 }
@@ -891,6 +869,7 @@ void updateMotorOutputs() {
             motor.stepHigh = true;
             motor.stepRiseUs = now;
             motor.lastStepUs = now;
+            motor.absoluteSteps += motor.direction;
         }
     }
 }
@@ -968,6 +947,9 @@ void setup() {
     if (!stepperTaskReady) Serial.println("ERR,STEPPER_TASK_CREATE");
     if (BENCH_TEST_MODE) {
         Serial.println("BENCH mode: BENCH,<channel 0-6>,<signed steps/s>,<duration ms>; DISARM stops.");
+        Serial.println("Legend: BENCH_TEL | JM1-JM7 = signed commanded STEP pulse totals; JE1-JE6 = encoder angles in degrees.");
+        Serial.println("JE shows NONE when an encoder is disabled, unavailable, or J4 has not been zeroed.");
+        Serial.println("Send ZERO_J4 at the J4 marker while disarmed; J4 angle is relative to that mark.");
     } else {
         Serial.println("POSE ready; align J4, ZERO_J4, verify encoders, CFG,I2C,1, CFG,CAL,1, ARM.");
     }
