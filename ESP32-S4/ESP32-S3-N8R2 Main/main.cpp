@@ -7,6 +7,7 @@
 #include <soc/gpio_struct.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include "CommandParser.h"
 
 constexpr uint8_t JOINT_COUNT = 6;
 constexpr uint8_t MOTOR_COUNT = 7;
@@ -24,8 +25,6 @@ constexpr bool BENCH_TEST_MODE = true;
 constexpr uint8_t BENCH_MOTOR_MASK = 0x11;
 // Bit N enables encoder channel N; use zero when testing motors without encoders.
 constexpr uint8_t BENCH_ENCODER_MASK = 0x08;
-constexpr long BENCH_MAX_STEPS_PER_SECOND = 10000;
-constexpr uint32_t BENCH_MAX_DURATION_MS = 5000;
 constexpr uint8_t J4_INDEX = 3;
 constexpr uint8_t TCA9548A_ADDRESS = 0x70;
 constexpr uint8_t MT6701_I2C_ADDRESS = 0x06;
@@ -44,23 +43,24 @@ static_assert(BENCH_MOTOR_MASK != 0 && (BENCH_MOTOR_MASK & ~0x7F) == 0,
 static_assert((BENCH_ENCODER_MASK & ~0x3F) == 0,
               "Bench encoder mask contains an invalid channel");
 
-// Motor order: DM556 channels 1-4, then TMC2209 X/Y/Z.
-const int8_t STEP_PINS[MOTOR_COUNT] = {4, 6, 15, 17, 8, 10, 12};
-const int8_t DIR_PINS[MOTOR_COUNT] = {5, 7, 16, 18, 9, 11, 13};
-const int8_t ENABLE_PINS[MOTOR_COUNT] = {-1, -1, -1, -1, 14, 14, 14};
 const int8_t EMERGENCY_STOP_PIN = 47;
-
-// Motor indexes 1 and 2 are the two J2 motors. The second is mechanically reversed.
-const uint8_t MOTOR_JOINT[MOTOR_COUNT] = {0, 1, 1, 2, 3, 4, 5};
-const int8_t MOTOR_DIRECTION_SIGN[MOTOR_COUNT] = {1, 1, -1, 1, 1, 1, 1};
-const uint8_t MOTOR_DIR_POSITIVE_LEVEL[MOTOR_COUNT] = {HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH};
-const uint8_t DRIVER_ENABLE_ACTIVE_LEVEL[MOTOR_COUNT] = {LOW, LOW, LOW, LOW, LOW, LOW, LOW};
 
 volatile bool I2C_MODE_CONFIRMED = false;
 volatile bool CALIBRATION_COMPLETE = false;
-volatile bool MOTION_ENABLED = false;
 volatile bool encoderHardwareReady = false;
 volatile bool j4Zeroed = false;
+
+enum class ArmState : uint8_t {
+    BOOT,
+    DISARMED,
+    ARMED,
+    IN_MOTION,
+    BENCH_MOTION,
+    FAULT_ESTOP,
+    FAULT_ENCODER
+};
+
+volatile ArmState armState = ArmState::BOOT;
 
 const float ENCODER_ZERO_DEG[JOINT_COUNT] = {0, 0, 0, 0, 0, 0};
 const int8_t ENCODER_DIRECTION_SIGN[JOINT_COUNT] = {1, 1, 1, 1, 1, 1};
@@ -68,9 +68,6 @@ const float JOINT_MIN_DEG[JOINT_COUNT] = {0, 0, 0, 0, 0, 0};
 const float JOINT_MAX_DEG[JOINT_COUNT] = {0, 0, 0, 0, 0, 0};
 const float MAX_JOINT_SPEED_DEG_S[JOINT_COUNT] = {0, 0, 0, 0, 0, 0};
 const float POSITION_KP_PER_S[JOINT_COUNT] = {1, 1, 1, 1, 1, 1};
-const float MOTOR_FULL_STEPS_PER_REV[MOTOR_COUNT] = {0, 0, 0, 0, 0, 0, 0};
-const float MOTOR_MICROSTEPS[MOTOR_COUNT] = {0, 0, 0, 0, 0, 0, 0};
-const float MOTOR_GEAR_RATIO[MOTOR_COUNT] = {0, 0, 0, 0, 0, 0, 0};
 
 struct EncoderState {
     uint16_t rawAngle = 0;
@@ -79,7 +76,17 @@ struct EncoderState {
     bool valid = false;
 };
 
-struct MotorState {
+struct StepperMotor {
+    int8_t stepPin;
+    int8_t dirPin;
+    int8_t enablePin;
+    uint8_t joint;
+    int8_t directionSign;
+    uint8_t positiveDirectionLevel;
+    uint8_t enableActiveLevel;
+    float fullStepsPerRev;
+    float microsteps;
+    float gearRatio;
     volatile float stepsPerSecond = 0;
     uint32_t lastStepUs = 0;
     uint32_t stepRiseUs = 0;
@@ -87,34 +94,72 @@ struct MotorState {
     int8_t direction = 0;
     bool stepHigh = false;
     volatile int32_t absoluteSteps = 0;
+
+    StepperMotor(int8_t step, int8_t dir, int8_t enable, uint8_t jointIndex,
+                 int8_t sign, uint8_t positiveLevel, uint8_t enableLevel,
+                 float fullSteps, float microstepCount, float ratio)
+        : stepPin(step), dirPin(dir), enablePin(enable), joint(jointIndex),
+          directionSign(sign), positiveDirectionLevel(positiveLevel),
+          enableActiveLevel(enableLevel), fullStepsPerRev(fullSteps),
+          microsteps(microstepCount), gearRatio(ratio) {}
+
+    void triggerStep(uint32_t now) {
+        digitalWrite(stepPin, HIGH);
+        stepHigh = true;
+        stepRiseUs = now;
+        lastStepUs = now;
+        absoluteSteps += direction;
+    }
+
+    void setStepLow() {
+        digitalWrite(stepPin, LOW);
+        stepHigh = false;
+    }
 };
 
 EncoderState encoders[JOINT_COUNT];
-MotorState motors[MOTOR_COUNT];
+// Motor order: DM556 channels 1-4, then TMC2209 X/Y/Z; channels 1 and 2 both drive J2.
+StepperMotor motors[MOTOR_COUNT] = {
+    {4, 5, -1, 0, 1, HIGH, LOW, 0, 0, 0},
+    {6, 7, -1, 1, 1, HIGH, LOW, 0, 0, 0},
+    {15, 16, -1, 1, -1, HIGH, LOW, 0, 0, 0},
+    {17, 18, -1, 2, 1, HIGH, LOW, 0, 0, 0},
+    {8, 9, 14, 3, 1, HIGH, LOW, 0, 0, 0},
+    {10, 11, 14, 4, 1, HIGH, LOW, 0, 0, 0},
+    {12, 13, 14, 5, 1, HIGH, LOW, 0, 0, 0}
+};
 float targetDeg[JOINT_COUNT] = {0, 0, 0, 0, 0, 0};
 volatile uint8_t faultMask = 0;
 uint32_t lastCommandMs = 0;
 uint32_t lastSensorUs = 0;
 uint32_t lastTelemetryMs = 0;
 uint32_t commandSequence = 0;
-volatile bool haveTarget = false;
-volatile bool driversEnabled = false;
-volatile bool eStopLatched = false;
 volatile bool stepperTaskReady = false;
 volatile int8_t benchMotorIndex = -1;
 uint32_t benchStopAtMs = 0;
-bool gcodeRelativeMode = false;
 uint32_t emergencyDisableSetLow = 0;
 uint32_t emergencyDisableClearLow = 0;
 uint32_t emergencyDisableSetHigh = 0;
 uint32_t emergencyDisableClearHigh = 0;
 bool stopServiced = false;
-char serialBuffer[160];
-size_t serialLength = 0;
 volatile int64_t hwEncoderCount = 0;
 volatile uint8_t hwEncoderState = 0;
 int64_t j4ZeroCount = 0;
 portMUX_TYPE amt103CountMux = portMUX_INITIALIZER_UNLOCKED;
+command_parser::CommandParser commandParser;
+
+bool motionPermitted() {
+    return armState == ArmState::ARMED || armState == ArmState::IN_MOTION ||
+           armState == ArmState::BENCH_MOTION;
+}
+
+bool targetActive() {
+    return armState == ArmState::IN_MOTION || armState == ArmState::BENCH_MOTION;
+}
+
+void disarm() {
+    if (armState != ArmState::FAULT_ESTOP) armState = ArmState::DISARMED;
+}
 
 bool validPin(int8_t pin) {
     return pin >= 0 && pin <= 48 && pin != 0 && pin != 3 && pin != 45 && pin != 46;
@@ -152,18 +197,19 @@ bool motorPinsReady() {
     if (BENCH_TEST_MODE && BENCH_MOTOR_MASK == 0) return false;
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
         if (!motorChannelConfigured(i)) continue;
-        if (!validPin(STEP_PINS[i]) || !validPin(DIR_PINS[i]) ||
-            (ENABLE_PINS[i] != -1 && !validPin(ENABLE_PINS[i])) ||
-            STEP_PINS[i] == DIR_PINS[i] ||
-            (ENABLE_PINS[i] >= 0 && (STEP_PINS[i] == ENABLE_PINS[i] || DIR_PINS[i] == ENABLE_PINS[i]))) return false;
+        if (!validPin(motors[i].stepPin) || !validPin(motors[i].dirPin) ||
+            (motors[i].enablePin != -1 && !validPin(motors[i].enablePin)) ||
+            motors[i].stepPin == motors[i].dirPin ||
+            (motors[i].enablePin >= 0 &&
+             (motors[i].stepPin == motors[i].enablePin || motors[i].dirPin == motors[i].enablePin))) return false;
         for (uint8_t j = 0; j < i; ++j) {
             if (!motorChannelConfigured(j)) continue;
-            if (STEP_PINS[i] == STEP_PINS[j] || STEP_PINS[i] == DIR_PINS[j] ||
-                (ENABLE_PINS[j] >= 0 && STEP_PINS[i] == ENABLE_PINS[j]) ||
-                DIR_PINS[i] == STEP_PINS[j] || DIR_PINS[i] == DIR_PINS[j] ||
-                (ENABLE_PINS[j] >= 0 && DIR_PINS[i] == ENABLE_PINS[j]) ||
-                (ENABLE_PINS[i] >= 0 && (ENABLE_PINS[i] == STEP_PINS[j] ||
-                                          ENABLE_PINS[i] == DIR_PINS[j]))) return false;
+            if (motors[i].stepPin == motors[j].stepPin || motors[i].stepPin == motors[j].dirPin ||
+                (motors[j].enablePin >= 0 && motors[i].stepPin == motors[j].enablePin) ||
+                motors[i].dirPin == motors[j].stepPin || motors[i].dirPin == motors[j].dirPin ||
+                (motors[j].enablePin >= 0 && motors[i].dirPin == motors[j].enablePin) ||
+                (motors[i].enablePin >= 0 && (motors[i].enablePin == motors[j].stepPin ||
+                                               motors[i].enablePin == motors[j].dirPin))) return false;
         }
     }
     return true;
@@ -174,8 +220,8 @@ bool benchConfigReady() {
     if (BENCH_ENCODER_MASK != 0 && (!encoderPinsReady() || !I2C_MODE_CONFIRMED)) return false;
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
         if (!motorChannelConfigured(i)) continue;
-        if (EMERGENCY_STOP_PIN == STEP_PINS[i] || EMERGENCY_STOP_PIN == DIR_PINS[i] ||
-            EMERGENCY_STOP_PIN == ENABLE_PINS[i]) return false;
+        if (EMERGENCY_STOP_PIN == motors[i].stepPin || EMERGENCY_STOP_PIN == motors[i].dirPin ||
+            EMERGENCY_STOP_PIN == motors[i].enablePin) return false;
     }
     return true;
 }
@@ -186,9 +232,9 @@ bool calibrationValuesReady() {
             (ENCODER_DIRECTION_SIGN[i] != 1 && ENCODER_DIRECTION_SIGN[i] != -1)) return false;
     }
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
-        if (MOTOR_FULL_STEPS_PER_REV[i] <= 0 || MOTOR_MICROSTEPS[i] <= 0 || MOTOR_GEAR_RATIO[i] <= 0 ||
-            MOTOR_JOINT[i] >= JOINT_COUNT ||
-            (MOTOR_DIRECTION_SIGN[i] != 1 && MOTOR_DIRECTION_SIGN[i] != -1)) return false;
+        if (motors[i].fullStepsPerRev <= 0 || motors[i].microsteps <= 0 || motors[i].gearRatio <= 0 ||
+            motors[i].joint >= JOINT_COUNT ||
+            (motors[i].directionSign != 1 && motors[i].directionSign != -1)) return false;
     }
     return true;
 }
@@ -208,30 +254,26 @@ bool allEncodersValid() {
 }
 
 void disableDrivers() {
-    driversEnabled = false;
     benchMotorIndex = -1;
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
         motors[i].stepsPerSecond = 0;
-        if (motorChannelConfigured(i) && validPin(ENABLE_PINS[i])) {
-            digitalWrite(ENABLE_PINS[i], !DRIVER_ENABLE_ACTIVE_LEVEL[i]);
+        if (motorChannelConfigured(i) && validPin(motors[i].enablePin)) {
+            digitalWrite(motors[i].enablePin, !motors[i].enableActiveLevel);
         }
     }
 }
 
 void enableDrivers() {
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
-        if (motorChannelConfigured(i) && validPin(ENABLE_PINS[i]) &&
+        if (motorChannelConfigured(i) && validPin(motors[i].enablePin) &&
             (!BENCH_TEST_MODE || i == benchMotorIndex)) {
-            digitalWrite(ENABLE_PINS[i], DRIVER_ENABLE_ACTIVE_LEVEL[i]);
+            digitalWrite(motors[i].enablePin, motors[i].enableActiveLevel);
         }
     }
-    driversEnabled = true;
 }
 
 void IRAM_ATTR emergencyStopISR() {
-    eStopLatched = true;
-    MOTION_ENABLED = false;
-    driversEnabled = false;
+    armState = ArmState::FAULT_ESTOP;
     GPIO.out_w1ts = emergencyDisableSetLow;
     GPIO.out_w1tc = emergencyDisableClearLow;
     GPIO.out1_w1ts.val = emergencyDisableSetHigh;
@@ -244,14 +286,14 @@ void prepareEmergencyDisableMasks() {
     emergencyDisableSetHigh = 0;
     emergencyDisableClearHigh = 0;
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
-        if (!motorChannelConfigured(i) || !validPin(ENABLE_PINS[i])) continue;
-        const bool disableLevel = !DRIVER_ENABLE_ACTIVE_LEVEL[i];
-        if (ENABLE_PINS[i] < 32) {
-            const uint32_t bit = 1UL << ENABLE_PINS[i];
+        if (!motorChannelConfigured(i) || !validPin(motors[i].enablePin)) continue;
+        const bool disableLevel = !motors[i].enableActiveLevel;
+        if (motors[i].enablePin < 32) {
+            const uint32_t bit = 1UL << motors[i].enablePin;
             if (disableLevel) emergencyDisableSetLow |= bit;
             else emergencyDisableClearLow |= bit;
         } else {
-            const uint32_t bit = 1UL << (ENABLE_PINS[i] - 32);
+            const uint32_t bit = 1UL << (motors[i].enablePin - 32);
             if (disableLevel) emergencyDisableSetHigh |= bit;
             else emergencyDisableClearHigh |= bit;
         }
@@ -360,6 +402,10 @@ bool readEncoder(uint8_t index) {
     return readMt6701(index);
 }
 
+/**
+ * @brief Refreshes every configured encoder and latches sensor faults.
+ * @note A failed read disables the drivers and exits active motion.
+ */
 void readAllEncoders() {
     faultMask = 0;
     for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
@@ -367,16 +413,15 @@ void readAllEncoders() {
         if (!readEncoder(i)) faultMask |= 1U << i;
     }
     if (faultMask != 0) {
-        haveTarget = false;
-        MOTION_ENABLED = false;
+        armState = ArmState::FAULT_ENCODER;
         disableDrivers();
+    } else if (armState == ArmState::FAULT_ENCODER) {
+        armState = ArmState::DISARMED;
     }
 }
 
 void stopAndLatch(const char *reason) {
-    eStopLatched = true;
-    MOTION_ENABLED = false;
-    haveTarget = false;
+    armState = ArmState::FAULT_ESTOP;
     benchStopAtMs = 0;
     stopServiced = true;
     disableDrivers();
@@ -386,7 +431,7 @@ void stopAndLatch(const char *reason) {
 
 void sendTelemetry() {
     Serial.print("TEL | ");
-    Serial.print((motionConfigReady() && MOTION_ENABLED && !eStopLatched && allEncodersValid()) ? "ARMED | " : "DISARMED | ");
+    Serial.print((motionConfigReady() && motionPermitted() && allEncodersValid()) ? "ARMED | " : "DISARMED | ");
     Serial.printf("FAULT:0x%02X | ", faultMask);
 
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
@@ -462,159 +507,12 @@ void testAndDisplayEncoders() {
     Serial.println("==================================\n");
 }
 
-bool processSetupCommand(char *line) {
-    if (strcmp(line, "SCAN_ENCODERS") == 0) {
-        if (MOTION_ENABLED || driversEnabled) {
-            Serial.println("ERR,SCAN_REQUIRES_DISARMED");
-        } else {
-            testAndDisplayEncoders();
-        }
-        return true;
-    }
-    if (strcmp(line, "ZERO_J4") == 0) {
-        if (MOTION_ENABLED || driversEnabled || !encoderHardwareReady) {
-            Serial.println("ERR,J4_ZERO_STATE");
-            return true;
-        }
-        int64_t count = 0;
-        if (!getAmt103Count(&count)) {
-            Serial.println("ERR,J4_COUNTER");
-            return true;
-        }
-        j4ZeroCount = count;
-        j4Zeroed = true;
-        readAmt103();
-        Serial.println("OK,J4_ZEROED");
-        return true;
-    }
-    if (strncmp(line, "BENCH,", 6) == 0) {
-        if (!BENCH_TEST_MODE) {
-            Serial.println("ERR,BENCH_DISABLED");
-            return true;
-        }
-        char *save = nullptr;
-        strtok_r(line, ",", &save);
-        char *channelField = strtok_r(nullptr, ",", &save);
-        char *rateField = strtok_r(nullptr, ",", &save);
-        char *durationField = strtok_r(nullptr, ",", &save);
-        if (channelField == nullptr || rateField == nullptr || durationField == nullptr ||
-            strtok_r(nullptr, ",", &save) != nullptr) {
-            Serial.println("ERR,BENCH_FORMAT");
-            return true;
-        }
-        char *end = nullptr;
-        const long channel = strtol(channelField, &end, 10);
-        if (end == channelField || *end != '\0' || channel < 0 || channel >= MOTOR_COUNT ||
-            !motorChannelConfigured(static_cast<uint8_t>(channel))) {
-            Serial.println("ERR,BENCH_CHANNEL");
-            return true;
-        }
-        end = nullptr;
-        const long rate = strtol(rateField, &end, 10);
-        if (end == rateField || *end != '\0' || rate == 0 ||
-            rate < -BENCH_MAX_STEPS_PER_SECOND || rate > BENCH_MAX_STEPS_PER_SECOND) {
-            Serial.println("ERR,BENCH_RATE");
-            return true;
-        }
-        end = nullptr;
-        const long duration = strtol(durationField, &end, 10);
-        if (end == durationField || *end != '\0' || duration < 1 ||
-            duration > BENCH_MAX_DURATION_MS) {
-            Serial.println("ERR,BENCH_DURATION");
-            return true;
-        }
-        if (eStopLatched) {
-            Serial.println("ERR,ESTOP");
-            return true;
-        }
-        if (!benchConfigReady() || !stepperTaskReady) {
-            Serial.println("ERR,BENCH_NOT_CONFIGURED");
-            return true;
-        }
-        for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
-            if (encoderChannelConfigured(i) && !encoders[i].valid) {
-                Serial.println("ERR,BENCH_ENCODER");
-                return true;
-            }
-        }
-
-        disableDrivers();
-        benchMotorIndex = static_cast<int8_t>(channel);
-        motors[channel].stepsPerSecond = static_cast<float>(rate);
-        haveTarget = true;
-        MOTION_ENABLED = true;
-        lastCommandMs = millis();
-        benchStopAtMs = lastCommandMs + static_cast<uint32_t>(duration);
-        enableDrivers();
-        Serial.println("OK,BENCH_STARTED");
-        return true;
-    }
-    if (strcmp(line, "ARM") == 0) {
-        if (BENCH_TEST_MODE) {
-            Serial.println("ERR,BENCH_ONLY");
-        } else if (eStopLatched) {
-            Serial.println("ERR,ESTOP");
-        } else if (!motionConfigReady()) {
-            Serial.println("ERR,NOT_CONFIGURED");
-        } else if (!allEncodersValid()) {
-            Serial.println("ERR,ENCODER");
-        } else {
-            MOTION_ENABLED = true;
-            lastCommandMs = millis();
-            enableDrivers();
-            Serial.println("OK,ARMED");
-        }
-        return true;
-    }
-    if (strcmp(line, "DISARM") == 0) {
-        MOTION_ENABLED = false;
-        haveTarget = false;
-        benchStopAtMs = 0;
-        disableDrivers();
-        Serial.println("OK,DISARMED");
-        return true;
-    }
-    if (strncmp(line, "CFG,", 4) != 0) return false;
-
-    char *save = nullptr;
-    strtok_r(line, ",", &save);
-    char *setting = strtok_r(nullptr, ",", &save);
-    char *value = strtok_r(nullptr, ",", &save);
-    if (setting == nullptr || value == nullptr || strtok_r(nullptr, ",", &save) != nullptr ||
-        (strcmp(value, "0") != 0 && strcmp(value, "1") != 0)) {
-        Serial.println("ERR,CFG_FORMAT");
-        return true;
-    }
-    const bool enabled = value[0] == '1';
-    if (strcmp(setting, "I2C") == 0) {
-        if (enabled && (!encoderPinsReady() || !encoderHardwareReady || !allEncodersValid())) {
-            Serial.println("ERR,I2C_NOT_VERIFIED");
-            return true;
-        }
-        I2C_MODE_CONFIRMED = enabled;
-    } else if (strcmp(setting, "CAL") == 0) {
-        if (enabled && (!motorPinsReady() || !calibrationValuesReady())) {
-            Serial.println("ERR,CALIBRATION_VALUES");
-            return true;
-        }
-        CALIBRATION_COMPLETE = enabled;
-    } else {
-        Serial.println("ERR,CFG_SETTING");
-        return true;
-    }
-    MOTION_ENABLED = false;
-    haveTarget = false;
-    disableDrivers();
-    Serial.println("OK,CONFIG");
-    return true;
-}
-
 void acceptJointTarget(const float requested[JOINT_COUNT]) {
     if (BENCH_TEST_MODE) {
         Serial.println("ERR,BENCH_ONLY");
         return;
     }
-    if (eStopLatched) {
+    if (armState == ArmState::FAULT_ESTOP) {
         Serial.println("ERR,ESTOP");
         return;
     }
@@ -622,7 +520,7 @@ void acceptJointTarget(const float requested[JOINT_COUNT]) {
         Serial.println("ERR,NOT_CONFIGURED");
         return;
     }
-    if (!MOTION_ENABLED) {
+    if (armState != ArmState::ARMED && armState != ArmState::IN_MOTION) {
         Serial.println("ERR,NOT_ARMED");
         return;
     }
@@ -638,158 +536,144 @@ void acceptJointTarget(const float requested[JOINT_COUNT]) {
     }
 
     memcpy(targetDeg, requested, sizeof(targetDeg));
-    haveTarget = true;
+    armState = ArmState::IN_MOTION;
     lastCommandMs = millis();
     enableDrivers();
     Serial.println("ok");
 }
 
-void processCsvCommand(char *line) {
-    if (strcmp(line, "X") == 0) {
-        stopAndLatch("HOST_ESTOP");
-        return;
-    }
-    if (processSetupCommand(line)) return;
-    char *save = nullptr;
-    char *field = strtok_r(line, ",", &save);
-    if (field == nullptr || strcmp(field, "G") != 0) {
-        Serial.println("ERR,COMMAND");
-        return;
-    }
-    field = strtok_r(nullptr, ",", &save);
-    if (field == nullptr) {
-        Serial.println("ERR,FORMAT");
-        return;
-    }
-    commandSequence = strtoul(field, nullptr, 10);
-    float requested[JOINT_COUNT];
-    for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
-        field = strtok_r(nullptr, ",", &save);
-        if (field == nullptr) {
-            Serial.println("ERR,FORMAT");
-            return;
-        }
-        requested[i] = strtof(field, nullptr);
-        if (!isfinite(requested[i])) {
-            Serial.println("ERR,VALUE");
-            return;
-        }
-    }
-    if (strtok_r(nullptr, ",", &save) != nullptr) {
-        Serial.println("ERR,FORMAT");
-        return;
-    }
-    acceptJointTarget(requested);
-}
-
-bool parseGcodeInteger(const char *word, char prefix, int *value) {
-    if (toupper(static_cast<unsigned char>(word[0])) != prefix) return false;
-    char *end = nullptr;
-    const long parsed = strtol(word + 1, &end, 10);
-    if (end == word + 1 || *end != '\0') return false;
-    *value = static_cast<int>(parsed);
-    return true;
-}
-
-void processGcode(char *line) {
-    char *comment = strchr(line, ';');
-    if (comment != nullptr) *comment = '\0';
-    char *save = nullptr;
-    char *word = strtok_r(line, " \t", &save);
-    if (word == nullptr) return;
-
-    const char type = toupper(static_cast<unsigned char>(word[0]));
-    int number = 0;
-    if (!parseGcodeInteger(word, type, &number)) {
-        Serial.println("ERR,GCODE_FORMAT");
-        return;
-    }
-    if (type == 'M') {
-        if (strtok_r(nullptr, " \t", &save) != nullptr) {
-            Serial.println("ERR,GCODE_FORMAT");
-        } else if (number == 17) {
-            char command[] = "ARM";
-            processSetupCommand(command);
-        } else if (number == 18) {
-            char command[] = "DISARM";
-            processSetupCommand(command);
-        } else if (number == 112) {
-            stopAndLatch("GCODE_ESTOP");
-        } else {
-            Serial.println("ERR,GCODE_UNSUPPORTED");
-        }
-        return;
-    }
-    if (type != 'G') {
-        Serial.println("ERR,GCODE_UNSUPPORTED");
-        return;
-    }
-    if (number == 90 || number == 91) {
-        if (strtok_r(nullptr, " \t", &save) != nullptr) {
-            Serial.println("ERR,GCODE_FORMAT");
-            return;
-        }
-        gcodeRelativeMode = number == 91;
-        Serial.println("ok");
-        return;
-    }
-    if (number != 0 && number != 1) {
-        Serial.println("ERR,GCODE_UNSUPPORTED");
-        return;
-    }
-
-    static const char jointAxes[JOINT_COUNT] = {'X', 'Y', 'Z', 'A', 'B', 'C'};
-    float requested[JOINT_COUNT];
-    bool axisSeen[JOINT_COUNT] = {false, false, false, false, false, false};
-    for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
-        requested[i] = haveTarget ? targetDeg[i] : encoders[i].angleDeg;
-    }
-
-    bool hasAxis = false;
-    while ((word = strtok_r(nullptr, " \t", &save)) != nullptr) {
-        const char axis = toupper(static_cast<unsigned char>(word[0]));
-        uint8_t joint = JOINT_COUNT;
-        for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
-            if (axis == jointAxes[i]) joint = i;
-        }
-        if (joint == JOINT_COUNT || axisSeen[joint]) {
-            Serial.println("ERR,GCODE_AXIS");
-            return;
-        }
-        char *end = nullptr;
-        const float value = strtof(word + 1, &end);
-        if (end == word + 1 || *end != '\0' || !isfinite(value)) {
-            Serial.println("ERR,GCODE_VALUE");
-            return;
-        }
-        if (gcodeRelativeMode) requested[joint] += value;
-        else requested[joint] = value;
-        axisSeen[joint] = true;
-        hasAxis = true;
-    }
-    if (!hasAxis) {
-        Serial.println("ERR,GCODE_NO_AXES");
-        return;
-    }
-    ++commandSequence;
-    acceptJointTarget(requested);
-}
-
+/**
+ * @brief Parses a serial line and executes its typed firmware command.
+ * @param line Mutable, null-terminated command received from the host.
+ * @note Hardware validation and all hardware side effects remain in this dispatcher.
+ */
 void processCommand(char *line) {
-    if (strcmp(line, "X") == 0) {
-        stopAndLatch("HOST_ESTOP");
+    float currentAngles[JOINT_COUNT];
+    for (uint8_t i = 0; i < JOINT_COUNT; ++i) currentAngles[i] = encoders[i].angleDeg;
+    const command_parser::ParsedCommand command = commandParser.parse(
+        line, targetDeg, currentAngles, armState == ArmState::IN_MOTION);
+    if (command.error != nullptr) {
+        Serial.println(command.error);
         return;
     }
-    if (processSetupCommand(line)) return;
-    if (line[0] == 'M' || line[0] == 'm' ||
-        ((line[0] == 'G' || line[0] == 'g') && line[1] != ',')) {
-        processGcode(line);
-    } else {
-        processCsvCommand(line);
+
+    switch (command.type) {
+        case command_parser::CommandType::HOST_ESTOP:
+            stopAndLatch("HOST_ESTOP");
+            break;
+        case command_parser::CommandType::GCODE_ESTOP:
+            stopAndLatch("GCODE_ESTOP");
+            break;
+        case command_parser::CommandType::SCAN_ENCODERS:
+            if (motionPermitted()) Serial.println("ERR,SCAN_REQUIRES_DISARMED");
+            else testAndDisplayEncoders();
+            break;
+        case command_parser::CommandType::ZERO_J4: {
+            if (motionPermitted() || !encoderHardwareReady) {
+                Serial.println("ERR,J4_ZERO_STATE");
+                break;
+            }
+            int64_t count = 0;
+            if (!getAmt103Count(&count)) {
+                Serial.println("ERR,J4_COUNTER");
+                break;
+            }
+            j4ZeroCount = count;
+            j4Zeroed = true;
+            readAmt103();
+            Serial.println("OK,J4_ZEROED");
+            break;
+        }
+        case command_parser::CommandType::BENCH: {
+            if (!BENCH_TEST_MODE) {
+                Serial.println("ERR,BENCH_DISABLED");
+                break;
+            }
+            if (!motorChannelConfigured(static_cast<uint8_t>(command.channel))) {
+                Serial.println("ERR,BENCH_CHANNEL");
+                break;
+            }
+            if (armState == ArmState::FAULT_ESTOP) {
+                Serial.println("ERR,ESTOP");
+                break;
+            }
+            if (!benchConfigReady() || !stepperTaskReady) {
+                Serial.println("ERR,BENCH_NOT_CONFIGURED");
+                break;
+            }
+            bool encodersReady = true;
+            for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
+                if (encoderChannelConfigured(i) && !encoders[i].valid) encodersReady = false;
+            }
+            if (!encodersReady) {
+                Serial.println("ERR,BENCH_ENCODER");
+                break;
+            }
+            disableDrivers();
+            benchMotorIndex = static_cast<int8_t>(command.channel);
+            motors[command.channel].stepsPerSecond = static_cast<float>(command.rate);
+            armState = ArmState::BENCH_MOTION;
+            lastCommandMs = millis();
+            benchStopAtMs = lastCommandMs + command.durationMs;
+            enableDrivers();
+            Serial.println("OK,BENCH_STARTED");
+            break;
+        }
+        case command_parser::CommandType::ARM:
+            if (BENCH_TEST_MODE) Serial.println("ERR,BENCH_ONLY");
+            else if (armState == ArmState::FAULT_ESTOP) Serial.println("ERR,ESTOP");
+            else if (!motionConfigReady()) Serial.println("ERR,NOT_CONFIGURED");
+            else if (!allEncodersValid()) Serial.println("ERR,ENCODER");
+            else {
+                armState = ArmState::ARMED;
+                lastCommandMs = millis();
+                enableDrivers();
+                Serial.println("OK,ARMED");
+            }
+            break;
+        case command_parser::CommandType::DISARM:
+            disarm();
+            benchStopAtMs = 0;
+            disableDrivers();
+            Serial.println("OK,DISARMED");
+            break;
+        case command_parser::CommandType::CONFIG_I2C:
+            if (command.enabled && (!encoderPinsReady() || !encoderHardwareReady || !allEncodersValid())) {
+                Serial.println("ERR,I2C_NOT_VERIFIED");
+                break;
+            }
+            I2C_MODE_CONFIRMED = command.enabled;
+            disarm();
+            disableDrivers();
+            Serial.println("OK,CONFIG");
+            break;
+        case command_parser::CommandType::CONFIG_CALIBRATION:
+            if (command.enabled && (!motorPinsReady() || !calibrationValuesReady())) {
+                Serial.println("ERR,CALIBRATION_VALUES");
+                break;
+            }
+            CALIBRATION_COMPLETE = command.enabled;
+            disarm();
+            disableDrivers();
+            Serial.println("OK,CONFIG");
+            break;
+        case command_parser::CommandType::MOTION_TARGET:
+            if (command.hasSequence) commandSequence = command.sequence;
+            else ++commandSequence;
+            acceptJointTarget(command.target);
+            break;
+        case command_parser::CommandType::SET_RELATIVE_MODE:
+        case command_parser::CommandType::SET_ABSOLUTE_MODE:
+            Serial.println("ok");
+            break;
+        case command_parser::CommandType::INVALID:
+            break;
     }
 }
 
 void readSerial() {
+    static char serialBuffer[160];
+    static size_t serialLength = 0;
     while (Serial.available() > 0) {
         const char value = static_cast<char>(Serial.read());
         if (value == '\r') continue;
@@ -814,12 +698,15 @@ void readSerial() {
     }
 }
 
+/**
+ * @brief Converts joint position error into bounded motor step rates.
+ * @note Runs only while configured, fault-free, and in the IN_MOTION state.
+ */
 void updatePositionController() {
     if (BENCH_TEST_MODE) return;
-    if (!motionConfigReady() || !MOTION_ENABLED || !haveTarget || !driversEnabled || eStopLatched || faultMask != 0) return;
+    if (!motionConfigReady() || armState != ArmState::IN_MOTION || faultMask != 0) return;
     if (millis() - lastCommandMs > COMMAND_TIMEOUT_MS) {
-        haveTarget = false;
-        MOTION_ENABLED = false;
+        disarm();
         disableDrivers();
         return;
     }
@@ -833,30 +720,33 @@ void updatePositionController() {
             (encoders[j].angleDeg >= JOINT_MAX_DEG[j] && jointSpeedDegS[j] > 0)) jointSpeedDegS[j] = 0;
     }
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
-        const uint8_t joint = MOTOR_JOINT[i];
-        const float stepsPerDegree = MOTOR_FULL_STEPS_PER_REV[i] * MOTOR_MICROSTEPS[i] *
-                                     MOTOR_GEAR_RATIO[i] / 360.0f;
-        const float rate = jointSpeedDegS[joint] * stepsPerDegree * MOTOR_DIRECTION_SIGN[i];
+        const uint8_t joint = motors[i].joint;
+        const float stepsPerDegree = motors[i].fullStepsPerRev * motors[i].microsteps *
+                         motors[i].gearRatio / 360.0f;
+        const float rate = jointSpeedDegS[joint] * stepsPerDegree * motors[i].directionSign;
         motors[i].stepsPerSecond = constrain(rate, -MAX_STEP_RATE, MAX_STEP_RATE);
     }
 }
 
+/**
+ * @brief Generates timed step pulses and direction changes for active motors.
+ * @note Called continuously by the dedicated stepper task.
+ */
 void updateMotorOutputs() {
     const uint32_t now = micros();
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
-        MotorState &motor = motors[i];
+        StepperMotor &motor = motors[i];
         if (motor.stepHigh && static_cast<uint32_t>(now - motor.stepRiseUs) >= STEP_PULSE_US) {
-            digitalWrite(STEP_PINS[i], LOW);
-            motor.stepHigh = false;
+            motor.setStepLow();
         }
         if (!motorChannelConfigured(i) || (BENCH_TEST_MODE && i != benchMotorIndex)) continue;
-        if (!MOTION_ENABLED || !haveTarget || !driversEnabled || eStopLatched || faultMask != 0) continue;
+        if (!targetActive() || faultMask != 0) continue;
         const float rate = motors[i].stepsPerSecond;
         if (fabsf(rate) < 1.0f || motor.stepHigh) continue;
         const int8_t direction = rate > 0 ? 1 : -1;
         if (direction != motor.direction) {
-            const uint8_t positive = MOTOR_DIR_POSITIVE_LEVEL[i];
-            digitalWrite(DIR_PINS[i], direction > 0 ? positive : !positive);
+            const uint8_t positive = motor.positiveDirectionLevel;
+            digitalWrite(motor.dirPin, direction > 0 ? positive : !positive);
             motor.direction = direction;
             motor.directionReadyUs = now + 5;
             continue;
@@ -865,11 +755,7 @@ void updateMotorOutputs() {
         const uint32_t calculatedPeriod = static_cast<uint32_t>(1000000.0f / fabsf(rate));
         const uint32_t period = calculatedPeriod == 0 ? 1U : calculatedPeriod;
         if (static_cast<uint32_t>(now - motor.lastStepUs) >= period) {
-            digitalWrite(STEP_PINS[i], HIGH);
-            motor.stepHigh = true;
-            motor.stepRiseUs = now;
-            motor.lastStepUs = now;
-            motor.absoluteSteps += motor.direction;
+            motor.triggerStep(now);
         }
     }
 }
@@ -909,17 +795,17 @@ void setup() {
     Serial.begin(SERIAL_BAUD);
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
         if (!motorChannelConfigured(i)) continue;
-        if (validPin(STEP_PINS[i])) {
-            pinMode(STEP_PINS[i], OUTPUT);
-            digitalWrite(STEP_PINS[i], LOW);
+        if (validPin(motors[i].stepPin)) {
+            pinMode(motors[i].stepPin, OUTPUT);
+            digitalWrite(motors[i].stepPin, LOW);
         }
-        if (validPin(DIR_PINS[i])) {
-            pinMode(DIR_PINS[i], OUTPUT);
-            digitalWrite(DIR_PINS[i], LOW);
+        if (validPin(motors[i].dirPin)) {
+            pinMode(motors[i].dirPin, OUTPUT);
+            digitalWrite(motors[i].dirPin, LOW);
         }
-        if (validPin(ENABLE_PINS[i])) {
-            pinMode(ENABLE_PINS[i], OUTPUT);
-            digitalWrite(ENABLE_PINS[i], !DRIVER_ENABLE_ACTIVE_LEVEL[i]);
+        if (validPin(motors[i].enablePin)) {
+            pinMode(motors[i].enablePin, OUTPUT);
+            digitalWrite(motors[i].enablePin, !motors[i].enableActiveLevel);
         }
     }
     prepareEmergencyDisableMasks();
@@ -942,6 +828,7 @@ void setup() {
         if (!encoderHardwareReady) Serial.println("ERR,ENCODER_INIT");
     }
     disableDrivers();
+    if (armState == ArmState::BOOT) armState = ArmState::DISARMED;
     stepperTaskReady = xTaskCreatePinnedToCore(stepperTask, "stepper", STEPPER_TASK_STACK_BYTES, nullptr,
                                                STEPPER_TASK_PRIORITY, nullptr, STEPPER_TASK_CORE) == pdPASS;
     if (!stepperTaskReady) Serial.println("ERR,STEPPER_TASK_CREATE");
@@ -959,16 +846,13 @@ void loop() {
     readSerial();
     if (BENCH_TEST_MODE && benchStopAtMs != 0 &&
         static_cast<int32_t>(millis() - benchStopAtMs) >= 0) {
-        MOTION_ENABLED = false;
-        haveTarget = false;
+        disarm();
         benchStopAtMs = 0;
         disableDrivers();
         Serial.println("OK,BENCH_DONE");
     }
-    if (eStopLatched && !stopServiced) {
+    if (armState == ArmState::FAULT_ESTOP && !stopServiced) {
         stopServiced = true;
-        haveTarget = false;
-        MOTION_ENABLED = false;
         disableDrivers();
         Serial.println("FAULT,HARDWARE_ESTOP");
     }
