@@ -7,9 +7,10 @@ import numpy as np
 import pygame
 import serial
 
+from gcode_formatter import format_joint_gcode
 import ikgeo_model
 from gamepad_input import GamepadController
-from serial_link import SerialConnection, format_joint_gcode
+from serial_link import SerialConnection
 
 
 SERIAL_PORT = os.environ.get("POSE_SERIAL_PORT", "COM10" if os.name == "nt" else "/dev/ttyACM0")

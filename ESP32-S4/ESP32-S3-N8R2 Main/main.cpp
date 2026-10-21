@@ -57,7 +57,8 @@ enum class ArmState : uint8_t {
     IN_MOTION,
     BENCH_MOTION,
     FAULT_ESTOP,
-    FAULT_ENCODER
+    FAULT_ENCODER,
+    FAULT_SYSTEM
 };
 
 volatile ArmState armState = ArmState::BOOT;
@@ -158,7 +159,9 @@ bool targetActive() {
 }
 
 void disarm() {
-    if (armState != ArmState::FAULT_ESTOP) armState = ArmState::DISARMED;
+    if (armState != ArmState::FAULT_ESTOP && armState != ArmState::FAULT_SYSTEM) {
+        armState = ArmState::DISARMED;
+    }
 }
 
 bool validPin(int8_t pin) {
@@ -413,7 +416,7 @@ void readAllEncoders() {
         if (!readEncoder(i)) faultMask |= 1U << i;
     }
     if (faultMask != 0) {
-        armState = ArmState::FAULT_ENCODER;
+        if (armState != ArmState::FAULT_SYSTEM) armState = ArmState::FAULT_ENCODER;
         disableDrivers();
     } else if (armState == ArmState::FAULT_ENCODER) {
         armState = ArmState::DISARMED;
@@ -516,6 +519,10 @@ void acceptJointTarget(const float requested[JOINT_COUNT]) {
         Serial.println("ERR,ESTOP");
         return;
     }
+    if (armState == ArmState::FAULT_SYSTEM) {
+        Serial.println("ERR,SYSTEM_FAULT");
+        return;
+    }
     if (!motionConfigReady()) {
         Serial.println("ERR,NOT_CONFIGURED");
         return;
@@ -597,6 +604,10 @@ void processCommand(char *line) {
                 Serial.println("ERR,ESTOP");
                 break;
             }
+            if (armState == ArmState::FAULT_SYSTEM) {
+                Serial.println("ERR,SYSTEM_FAULT");
+                break;
+            }
             if (!benchConfigReady() || !stepperTaskReady) {
                 Serial.println("ERR,BENCH_NOT_CONFIGURED");
                 break;
@@ -622,6 +633,7 @@ void processCommand(char *line) {
         case command_parser::CommandType::ARM:
             if (BENCH_TEST_MODE) Serial.println("ERR,BENCH_ONLY");
             else if (armState == ArmState::FAULT_ESTOP) Serial.println("ERR,ESTOP");
+            else if (armState == ArmState::FAULT_SYSTEM) Serial.println("ERR,SYSTEM_FAULT");
             else if (!motionConfigReady()) Serial.println("ERR,NOT_CONFIGURED");
             else if (!allEncodersValid()) Serial.println("ERR,ENCODER");
             else {
@@ -635,7 +647,8 @@ void processCommand(char *line) {
             disarm();
             benchStopAtMs = 0;
             disableDrivers();
-            Serial.println("OK,DISARMED");
+            if (armState == ArmState::FAULT_SYSTEM) Serial.println("ERR,SYSTEM_FAULT");
+            else Serial.println("OK,DISARMED");
             break;
         case command_parser::CommandType::CONFIG_I2C:
             if (command.enabled && (!encoderPinsReady() || !encoderHardwareReady || !allEncodersValid())) {
@@ -831,13 +844,16 @@ void setup() {
     if (armState == ArmState::BOOT) armState = ArmState::DISARMED;
     stepperTaskReady = xTaskCreatePinnedToCore(stepperTask, "stepper", STEPPER_TASK_STACK_BYTES, nullptr,
                                                STEPPER_TASK_PRIORITY, nullptr, STEPPER_TASK_CORE) == pdPASS;
-    if (!stepperTaskReady) Serial.println("ERR,STEPPER_TASK_CREATE");
+    if (!stepperTaskReady) {
+        armState = ArmState::FAULT_SYSTEM;
+        Serial.println("ERR,STEPPER_TASK_CREATE");
+    }
     if (BENCH_TEST_MODE) {
         Serial.println("BENCH mode: BENCH,<channel 0-6>,<signed steps/s>,<duration ms>; DISARM stops.");
         Serial.println("Legend: BENCH_TEL | JM1-JM7 = signed commanded STEP pulse totals; JE1-JE6 = encoder angles in degrees.");
         Serial.println("JE shows NONE when an encoder is disabled, unavailable, or J4 has not been zeroed.");
         Serial.println("Send ZERO_J4 at the J4 marker while disarmed; J4 angle is relative to that mark.");
-    } else {
+    } else if (stepperTaskReady) {
         Serial.println("POSE ready; align J4, ZERO_J4, verify encoders, CFG,I2C,1, CFG,CAL,1, ARM.");
     }
 }
@@ -850,6 +866,11 @@ void loop() {
         benchStopAtMs = 0;
         disableDrivers();
         Serial.println("OK,BENCH_DONE");
+    }
+    if (armState == ArmState::FAULT_SYSTEM && !stopServiced) {
+        stopServiced = true;
+        disableDrivers();
+        Serial.println("FAULT,SYSTEM,STEPPER_TASK_CREATE");
     }
     if (armState == ArmState::FAULT_ESTOP && !stopServiced) {
         stopServiced = true;
