@@ -11,7 +11,7 @@ h = np.array([
     [0.0, 0.0, 1.0]   # J6
 ])
 
-# Converted from mm to meters to match the Controller Input.py speeds
+# Converted from mm to meters to match the controller translation speeds
 p = np.array([
     [0.0, 0.0,      0.0],       # Base to J1
     [0.0, 0.095825, 0.0],       # J1 to J2
