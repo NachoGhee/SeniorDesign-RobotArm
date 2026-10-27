@@ -35,6 +35,22 @@ constexpr uint8_t TCA9548A_ADDRESS = 0x70;
 constexpr uint8_t MT6701_I2C_ADDRESS = 0x06;
 constexpr uint8_t MT6701_ANGLE_REGISTER = 0x03;
 constexpr uint8_t MT6701_MUX_CHANNEL[JOINT_COUNT] = {0, 1, 2, 5, 3, 4};
+constexpr float DM556_PULSES_PER_REV = 1600.0f;
+constexpr int8_t DM556_J2_STEP_PIN = 4;
+constexpr int8_t DM556_J2_DIR_PIN = 5;
+constexpr int8_t DM556_J2_SECOND_STEP_PIN = 6;
+constexpr int8_t DM556_J2_SECOND_DIR_PIN = 7;
+constexpr int8_t DM556_J1_STEP_PIN = 15;
+constexpr int8_t DM556_J1_DIR_PIN = 16;
+constexpr int8_t TMC2209_A_STEP_PIN = 17;
+constexpr int8_t TMC2209_A_DIR_PIN = 18;
+constexpr int8_t TMC2209_X_STEP_PIN = 8;
+constexpr int8_t TMC2209_X_DIR_PIN = 9;
+constexpr int8_t TMC2209_Y_STEP_PIN = 10;
+constexpr int8_t TMC2209_Y_DIR_PIN = 11;
+constexpr int8_t TMC2209_Z_STEP_PIN = 12;
+constexpr int8_t TMC2209_Z_DIR_PIN = 13;
+constexpr int8_t CNC_SHIELD_ENABLE_PIN = 14;
 constexpr int8_t I2C_SDA_PIN = 1;
 constexpr int8_t I2C_SCL_PIN = 2;
 constexpr int8_t LIMIT_SWITCH_PIN = 39;
@@ -120,15 +136,15 @@ bool j4TrackerInitialized = false;
 float j4PreviousMotorAngleDeg = 0;
 float j4BacklashRemainingMotorDeg = 0;
 int8_t j4LastMotorDirection = 0;
-// Motor order: DM556 channels 1-4, then TMC2209 X/Y/Z; channels 1 and 2 both drive J2.
+// Motor order: DM556 channels 1-3, then TMC2209 A/X/Y/Z; channels 1 and 2 both drive J2.
 StepperMotor motors[MOTOR_COUNT] = {
-    {4, 5, -1, 0, 1, HIGH, LOW, 0, 0, 0},
-    {6, 7, -1, 1, 1, HIGH, LOW, 0, 0, 0},
-    {15, 16, -1, 1, -1, HIGH, LOW, 0, 0, 0},
-    {17, 18, -1, 2, 1, HIGH, LOW, 0, 0, 0},
-    {8, 9, 14, 3, 1, HIGH, LOW, 0, 0, J4_GEAR_RATIO},
-    {10, 11, 14, 4, 1, HIGH, LOW, 0, 0, 0},
-    {12, 13, 14, 5, 1, HIGH, LOW, 0, 0, 0}
+    {DM556_J2_STEP_PIN, DM556_J2_DIR_PIN, -1, 0, 1, HIGH, LOW, DM556_PULSES_PER_REV, 1, 0},
+    {DM556_J2_SECOND_STEP_PIN, DM556_J2_SECOND_DIR_PIN, -1, 1, 1, HIGH, LOW, DM556_PULSES_PER_REV, 1, 0},
+    {DM556_J1_STEP_PIN, DM556_J1_DIR_PIN, -1, 1, -1, HIGH, LOW, DM556_PULSES_PER_REV, 1, 0},
+    {TMC2209_A_STEP_PIN, TMC2209_A_DIR_PIN, CNC_SHIELD_ENABLE_PIN, 2, 1, HIGH, LOW, 0, 0, 0},
+    {TMC2209_X_STEP_PIN, TMC2209_X_DIR_PIN, CNC_SHIELD_ENABLE_PIN, 3, 1, HIGH, LOW, 0, 0, J4_GEAR_RATIO},
+    {TMC2209_Y_STEP_PIN, TMC2209_Y_DIR_PIN, CNC_SHIELD_ENABLE_PIN, 4, 1, HIGH, LOW, 0, 0, 0},
+    {TMC2209_Z_STEP_PIN, TMC2209_Z_DIR_PIN, CNC_SHIELD_ENABLE_PIN, 5, 1, HIGH, LOW, 0, 0, 0}
 };
 float targetDeg[JOINT_COUNT] = {0, 0, 0, 0, 0, 0};
 volatile uint8_t faultMask = 0;
