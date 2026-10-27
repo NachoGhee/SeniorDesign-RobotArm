@@ -88,11 +88,14 @@ def main(argv=None):
                     print("E-stop sent; controller must be power-cycled to clear it.")
                     running = False
                 elif action == "zero_j4":
-                    connection.send_command("ZERO_J4")
+                    if not controller_ready:
+                        connection.send_command("ZERO_J4")
                 elif action == "confirm_i2c":
-                    connection.send_command("CFG,I2C,1")
+                    if not controller_ready:
+                        connection.send_command("CFG,I2C,1")
                 elif action == "confirm_calibration":
-                    connection.send_command("CFG,CAL,1")
+                    if not controller_ready:
+                        connection.send_command("CFG,CAL,1")
                 elif action == "arm":
                     if ik_ready:
                         connection.send_command("G90")

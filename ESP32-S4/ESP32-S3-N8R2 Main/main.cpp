@@ -655,6 +655,10 @@ void processCommand(char *line) {
             else Serial.println("OK,DISARMED");
             break;
         case command_parser::CommandType::CONFIG_I2C:
+            if (motionPermitted()) {
+                Serial.println("ERR,CONFIG_REQUIRES_DISARMED");
+                break;
+            }
             if (command.enabled && (!encoderPinsReady() || !encoderHardwareReady || !allEncodersValid())) {
                 Serial.println("ERR,I2C_NOT_VERIFIED");
                 break;
@@ -665,6 +669,10 @@ void processCommand(char *line) {
             Serial.println("OK,CONFIG");
             break;
         case command_parser::CommandType::CONFIG_CALIBRATION:
+            if (motionPermitted()) {
+                Serial.println("ERR,CONFIG_REQUIRES_DISARMED");
+                break;
+            }
             if (command.enabled && (!motorPinsReady() || !calibrationValuesReady())) {
                 Serial.println("ERR,CALIBRATION_VALUES");
                 break;
