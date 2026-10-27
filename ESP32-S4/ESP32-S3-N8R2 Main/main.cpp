@@ -24,7 +24,7 @@ constexpr bool BENCH_TEST_MODE = true;
 // Bit N enables motor channel N for bench commands; only enabled channels need pins.
 constexpr uint8_t BENCH_MOTOR_MASK = 0x7F;
 // Bit N enables encoder channel N; set to zero when testing motors without encoders.
-constexpr uint8_t BENCH_ENCODER_MASK = 0x00;
+constexpr uint8_t BENCH_ENCODER_MASK = 0x01;
 constexpr uint8_t J4_INDEX = 3;
 constexpr float J4_GEAR_RATIO = 100.0f;
 constexpr float J4_BACKLASH_ARC_MIN = 22.0f;
@@ -34,7 +34,7 @@ constexpr float J4_STARTUP_ANGLE_DEG = 0.0f;
 constexpr uint8_t TCA9548A_ADDRESS = 0x70;
 constexpr uint8_t MT6701_I2C_ADDRESS = 0x06;
 constexpr uint8_t MT6701_ANGLE_REGISTER = 0x03;
-constexpr uint8_t MT6701_MUX_CHANNEL[JOINT_COUNT] = {0, 1, 2, 5, 3, 4};
+constexpr uint8_t MT6701_MUX_CHANNEL[JOINT_COUNT] = {0, 1, 2, 3, 4, 5};
 constexpr float DM556_PULSES_PER_REV = 1600.0f;
 constexpr int8_t DM556_J2_STEP_PIN = 4;
 constexpr int8_t DM556_J2_DIR_PIN = 5;
