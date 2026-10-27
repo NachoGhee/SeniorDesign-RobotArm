@@ -22,9 +22,9 @@ constexpr UBaseType_t STEPPER_TASK_PRIORITY = 3;
 constexpr BaseType_t STEPPER_TASK_CORE = 0;
 constexpr bool BENCH_TEST_MODE = true;
 // Bit N enables motor channel N for bench commands; only enabled channels need pins.
-constexpr uint8_t BENCH_MOTOR_MASK = 0x11;
-// Bit N enables encoder channel N; use zero when testing motors without encoders.
-constexpr uint8_t BENCH_ENCODER_MASK = 0x08;
+constexpr uint8_t BENCH_MOTOR_MASK = 0x7F;
+// Bit N enables encoder channel N; set to zero when testing motors without encoders.
+constexpr uint8_t BENCH_ENCODER_MASK = 0x3F;
 constexpr uint8_t J4_INDEX = 3;
 constexpr uint8_t TCA9548A_ADDRESS = 0x70;
 constexpr uint8_t MT6701_I2C_ADDRESS = 0x06;
@@ -35,6 +35,7 @@ constexpr int8_t I2C_SDA_PIN = 1;
 constexpr int8_t I2C_SCL_PIN = 2;
 constexpr int8_t AMT103_A_PIN = 21;
 constexpr int8_t AMT103_B_PIN = 38;
+constexpr int8_t LIMIT_SWITCH_PIN = 39;
 constexpr int32_t AMT103_PPR = 1024;
 constexpr int32_t AMT103_QUADRATURE_FACTOR = 4;
 constexpr float J4_GEAR_RATIO = 1.0f;
@@ -42,8 +43,6 @@ static_assert(BENCH_MOTOR_MASK != 0 && (BENCH_MOTOR_MASK & ~0x7F) == 0,
               "Bench mode requires a valid motor channel mask");
 static_assert((BENCH_ENCODER_MASK & ~0x3F) == 0,
               "Bench encoder mask contains an invalid channel");
-
-const int8_t EMERGENCY_STOP_PIN = 47;
 
 volatile bool I2C_MODE_CONFIRMED = false;
 volatile bool CALIBRATION_COMPLETE = false;
@@ -137,6 +136,7 @@ uint32_t lastTelemetryMs = 0;
 uint32_t commandSequence = 0;
 volatile bool stepperTaskReady = false;
 volatile int8_t benchMotorIndex = -1;
+volatile bool limitSwitchTriggered = false;
 uint32_t benchStopAtMs = 0;
 uint32_t emergencyDisableSetLow = 0;
 uint32_t emergencyDisableClearLow = 0;
@@ -165,7 +165,9 @@ void disarm() {
 }
 
 bool validPin(int8_t pin) {
-    return pin >= 0 && pin <= 48 && pin != 0 && pin != 3 && pin != 45 && pin != 46;
+    return pin >= 0 && pin <= 48 && pin != 0 && pin != 3 && pin != 19 && pin != 20 &&
+           pin != 35 && pin != 36 && pin != 37 && pin != 43 && pin != 44 &&
+           pin != 45 && pin != 46;
 }
 
 bool motorChannelConfigured(uint8_t index) {
@@ -197,14 +199,16 @@ bool encoderPinsReady() {
 }
 
 bool motorPinsReady() {
-    if (BENCH_TEST_MODE && BENCH_MOTOR_MASK == 0) return false;
+    if ((BENCH_TEST_MODE && BENCH_MOTOR_MASK == 0) || !validPin(LIMIT_SWITCH_PIN)) return false;
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
         if (!motorChannelConfigured(i)) continue;
         if (!validPin(motors[i].stepPin) || !validPin(motors[i].dirPin) ||
             (motors[i].enablePin != -1 && !validPin(motors[i].enablePin)) ||
             motors[i].stepPin == motors[i].dirPin ||
+            motors[i].stepPin == LIMIT_SWITCH_PIN || motors[i].dirPin == LIMIT_SWITCH_PIN ||
             (motors[i].enablePin >= 0 &&
-             (motors[i].stepPin == motors[i].enablePin || motors[i].dirPin == motors[i].enablePin))) return false;
+             (motors[i].stepPin == motors[i].enablePin || motors[i].dirPin == motors[i].enablePin ||
+                            motors[i].enablePin == LIMIT_SWITCH_PIN))) return false;
         for (uint8_t j = 0; j < i; ++j) {
             if (!motorChannelConfigured(j)) continue;
             if (motors[i].stepPin == motors[j].stepPin || motors[i].stepPin == motors[j].dirPin ||
@@ -219,13 +223,8 @@ bool motorPinsReady() {
 }
 
 bool benchConfigReady() {
-    if (!BENCH_TEST_MODE || !motorPinsReady() || !validPin(EMERGENCY_STOP_PIN)) return false;
+    if (!BENCH_TEST_MODE || !motorPinsReady()) return false;
     if (BENCH_ENCODER_MASK != 0 && (!encoderPinsReady() || !I2C_MODE_CONFIRMED)) return false;
-    for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
-        if (!motorChannelConfigured(i)) continue;
-        if (EMERGENCY_STOP_PIN == motors[i].stepPin || EMERGENCY_STOP_PIN == motors[i].dirPin ||
-            EMERGENCY_STOP_PIN == motors[i].enablePin) return false;
-    }
     return true;
 }
 
@@ -281,6 +280,11 @@ void IRAM_ATTR emergencyStopISR() {
     GPIO.out_w1tc = emergencyDisableClearLow;
     GPIO.out1_w1ts.val = emergencyDisableSetHigh;
     GPIO.out1_w1tc.val = emergencyDisableClearHigh;
+}
+
+void IRAM_ATTR limitSwitchISR() {
+    limitSwitchTriggered = true;
+    emergencyStopISR();
 }
 
 void prepareEmergencyDisableMasks() {
@@ -822,10 +826,10 @@ void setup() {
         }
     }
     prepareEmergencyDisableMasks();
-    if (validPin(EMERGENCY_STOP_PIN)) {
-        pinMode(EMERGENCY_STOP_PIN, INPUT_PULLUP);
-        attachInterrupt(digitalPinToInterrupt(EMERGENCY_STOP_PIN), emergencyStopISR, FALLING);
-        if (digitalRead(EMERGENCY_STOP_PIN) == LOW) emergencyStopISR();
+    if (validPin(LIMIT_SWITCH_PIN)) {
+        pinMode(LIMIT_SWITCH_PIN, INPUT_PULLUP);
+        attachInterrupt(digitalPinToInterrupt(LIMIT_SWITCH_PIN), limitSwitchISR, FALLING);
+        if (digitalRead(LIMIT_SWITCH_PIN) == LOW) limitSwitchISR();
     }
     if (encoderPinsReady() && (!BENCH_TEST_MODE || BENCH_ENCODER_MASK != 0)) {
         bool muxReady = true;
@@ -875,7 +879,7 @@ void loop() {
     if (armState == ArmState::FAULT_ESTOP && !stopServiced) {
         stopServiced = true;
         disableDrivers();
-        Serial.println("FAULT,HARDWARE_ESTOP");
+        Serial.println("FAULT,LIMIT_SWITCH");
     }
     const uint32_t now = micros();
     if ((!BENCH_TEST_MODE || BENCH_ENCODER_MASK != 0) && encoderPinsReady() && encoderHardwareReady &&

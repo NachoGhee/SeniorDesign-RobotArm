@@ -43,7 +43,9 @@ class GamepadController:
                 actions.append("estop")
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_s:
-                    actions.append("confirm_ssi")
+                    actions.append("confirm_i2c")
+                elif event.key == pygame.K_z:
+                    actions.append("zero_j4")
                 elif event.key == pygame.K_c:
                     actions.append("confirm_calibration")
                 elif event.key == pygame.K_a:

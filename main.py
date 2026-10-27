@@ -63,7 +63,7 @@ def main(argv=None):
         print("Cartesian IK disabled until ikgeo_model.py is configured:")
         for error in model_errors:
             print(f"  - {error}")
-    print("Keys: S=confirm SSI, C=confirm calibration, A=arm, D=disarm; controller button 1=E-stop.")
+    print("Keys: Z=zero J4 at its mark, S=confirm I2C, C=confirm calibration, A=arm, D=disarm; controller button 1=E-stop.")
 
     target_pose = None
     seed_angles_rad = None
@@ -87,8 +87,10 @@ def main(argv=None):
                     connection.send_command("X")
                     print("E-stop sent; controller must be power-cycled to clear it.")
                     running = False
-                elif action == "confirm_ssi":
-                    connection.send_command("CFG,SSI,1")
+                elif action == "zero_j4":
+                    connection.send_command("ZERO_J4")
+                elif action == "confirm_i2c":
+                    connection.send_command("CFG,I2C,1")
                 elif action == "confirm_calibration":
                     connection.send_command("CFG,CAL,1")
                 elif action == "arm":
@@ -114,7 +116,9 @@ def main(argv=None):
                     target_pose = None
                     seed_angles_rad = None
                     controller_ready = False
-                elif telemetry["ready"] and all(angle >= 0 for angle in telemetry["angles"]):
+                elif telemetry["ready"] and len(telemetry["angles"]) == 6 and np.all(
+                    np.isfinite(telemetry["angles"])
+                ):
                     controller_ready = True
                     last_not_ready_message = False
                     if target_pose is None and ik_ready:
@@ -158,7 +162,7 @@ def main(argv=None):
                     last_send = now
             elif telemetry is not None and not telemetry["ready"]:
                 if not last_not_ready_message:
-                    print("Firmware is not armed: configure SSI pins and calibration before motion.")
+                    print("Firmware is not ready: zero J4, verify encoders, and confirm I2C and calibration.")
                     last_not_ready_message = True
 
             screen.fill((30, 30, 30))
