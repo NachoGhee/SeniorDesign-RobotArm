@@ -8,7 +8,6 @@ CARTESIAN_AXIS_TO_XYZ = {0: 0, 1: 1, 4: 2}
 CARTESIAN_AXIS_SIGN = {0: 1, 1: -1, 4: 1}
 CARTESIAN_SPEED_M_S = (0.10, 0.10, 0.10)
 ESTOP_BUTTON = 1
-SELECT_ZERO_BUTTON = 6
 START_INIT_BUTTON = 7
 
 
@@ -44,16 +43,12 @@ class GamepadController:
             elif event.type == pygame.JOYBUTTONDOWN:
                 if event.button == ESTOP_BUTTON:
                     actions.append("estop")
-                elif event.button == SELECT_ZERO_BUTTON:
-                    actions.append("zero_j4")
                 elif event.button == START_INIT_BUTTON:
                     actions.append("confirm_i2c")
                     actions.append("confirm_calibration")
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_s:
                     actions.append("confirm_i2c")
-                elif event.key == pygame.K_z:
-                    actions.append("zero_j4")
                 elif event.key == pygame.K_c:
                     actions.append("confirm_calibration")
                 elif event.key == pygame.K_a:

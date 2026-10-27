@@ -29,16 +29,10 @@ constexpr uint8_t J4_INDEX = 3;
 constexpr uint8_t TCA9548A_ADDRESS = 0x70;
 constexpr uint8_t MT6701_I2C_ADDRESS = 0x06;
 constexpr uint8_t MT6701_ANGLE_REGISTER = 0x03;
-constexpr uint8_t NO_MUX_CHANNEL = 0xFF;
-constexpr uint8_t MT6701_MUX_CHANNEL[JOINT_COUNT] = {0, 1, 2, NO_MUX_CHANNEL, 3, 4};
+constexpr uint8_t MT6701_MUX_CHANNEL[JOINT_COUNT] = {0, 1, 2, 5, 3, 4};
 constexpr int8_t I2C_SDA_PIN = 1;
 constexpr int8_t I2C_SCL_PIN = 2;
-constexpr int8_t AMT103_A_PIN = 21;
-constexpr int8_t AMT103_B_PIN = 38;
 constexpr int8_t LIMIT_SWITCH_PIN = 39;
-constexpr int32_t AMT103_PPR = 1024;
-constexpr int32_t AMT103_QUADRATURE_FACTOR = 4;
-constexpr float J4_GEAR_RATIO = 1.0f;
 static_assert(BENCH_MOTOR_MASK != 0 && (BENCH_MOTOR_MASK & ~0x7F) == 0,
               "Bench mode requires a valid motor channel mask");
 static_assert((BENCH_ENCODER_MASK & ~0x3F) == 0,
@@ -47,7 +41,6 @@ static_assert((BENCH_ENCODER_MASK & ~0x3F) == 0,
 volatile bool I2C_MODE_CONFIRMED = false;
 volatile bool CALIBRATION_COMPLETE = false;
 volatile bool encoderHardwareReady = false;
-volatile bool j4Zeroed = false;
 
 enum class ArmState : uint8_t {
     BOOT,
@@ -143,10 +136,6 @@ uint32_t emergencyDisableClearLow = 0;
 uint32_t emergencyDisableSetHigh = 0;
 uint32_t emergencyDisableClearHigh = 0;
 bool stopServiced = false;
-volatile int64_t hwEncoderCount = 0;
-volatile uint8_t hwEncoderState = 0;
-int64_t j4ZeroCount = 0;
-portMUX_TYPE amt103CountMux = portMUX_INITIALIZER_UNLOCKED;
 command_parser::CommandParser commandParser;
 
 bool motionPermitted() {
@@ -182,17 +171,16 @@ bool encoderChannelConfigured(uint8_t index) {
 
 bool muxEncoderConfigured() {
     for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
-        if (i != J4_INDEX && encoderChannelConfigured(i)) return true;
+        if (encoderChannelConfigured(i)) return true;
     }
     return false;
 }
 
 bool encoderPinsReady() {
-    if (!validPin(I2C_SDA_PIN) || !validPin(I2C_SCL_PIN) || I2C_SDA_PIN == I2C_SCL_PIN ||
-        !validPin(AMT103_A_PIN) || !validPin(AMT103_B_PIN) || AMT103_A_PIN == AMT103_B_PIN) return false;
+    if (!validPin(I2C_SDA_PIN) || !validPin(I2C_SCL_PIN) || I2C_SDA_PIN == I2C_SCL_PIN) return false;
     if (BENCH_TEST_MODE && BENCH_ENCODER_MASK == 0) return true;
     for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
-        if (!encoderChannelConfigured(i) || i == J4_INDEX) continue;
+        if (!encoderChannelConfigured(i)) continue;
         if (MT6701_MUX_CHANNEL[i] >= 8) return false;
     }
     return true;
@@ -242,7 +230,7 @@ bool calibrationValuesReady() {
 }
 
 bool motionConfigReady() {
-    return I2C_MODE_CONFIRMED && encoderHardwareReady && j4Zeroed && CALIBRATION_COMPLETE && encoderPinsReady() &&
+    return I2C_MODE_CONFIRMED && encoderHardwareReady && CALIBRATION_COMPLETE && encoderPinsReady() &&
            motorPinsReady() && calibrationValuesReady() && stepperTaskReady;
 }
 
@@ -307,40 +295,6 @@ void prepareEmergencyDisableMasks() {
     }
 }
 
-void IRAM_ATTR amt103SoftwareIsr() {
-    const uint8_t channelA = digitalRead(AMT103_A_PIN);
-    const uint8_t channelB = digitalRead(AMT103_B_PIN);
-    const uint8_t currentState = (channelA << 1) | channelB;
-
-    portENTER_CRITICAL_ISR(&amt103CountMux);
-    const uint8_t transition = (hwEncoderState << 2) | currentState;
-    switch (transition) {
-        case 0b0010:
-        case 0b1011:
-        case 0b1101:
-        case 0b0100:
-            ++hwEncoderCount;
-            break;
-        case 0b0001:
-        case 0b0111:
-        case 0b1110:
-        case 0b1000:
-            --hwEncoderCount;
-            break;
-    }
-    hwEncoderState = currentState;
-    portEXIT_CRITICAL_ISR(&amt103CountMux);
-}
-
-bool initAmt103Pcnt() {
-    pinMode(AMT103_A_PIN, INPUT);
-    pinMode(AMT103_B_PIN, INPUT);
-    hwEncoderState = (digitalRead(AMT103_A_PIN) << 1) | digitalRead(AMT103_B_PIN);
-    attachInterrupt(digitalPinToInterrupt(AMT103_A_PIN), amt103SoftwareIsr, CHANGE);
-    attachInterrupt(digitalPinToInterrupt(AMT103_B_PIN), amt103SoftwareIsr, CHANGE);
-    return true;
-}
-
 bool selectMuxChannel(uint8_t channel) {
     if (channel >= 8) return false;
     Wire.beginTransmission(TCA9548A_ADDRESS);
@@ -349,8 +303,7 @@ bool selectMuxChannel(uint8_t channel) {
 }
 
 bool readMt6701(uint8_t index) {
-    if (!encoderChannelConfigured(index) || index == J4_INDEX ||
-        !selectMuxChannel(MT6701_MUX_CHANNEL[index])) {
+    if (!encoderChannelConfigured(index) || !selectMuxChannel(MT6701_MUX_CHANNEL[index])) {
         if (index < JOINT_COUNT) {
             encoders[index].valid = false;
             encoders[index].angleDeg = NAN;
@@ -379,33 +332,8 @@ bool readMt6701(uint8_t index) {
     return true;
 }
 
-bool getAmt103Count(int64_t *count) {
-    portENTER_CRITICAL(&amt103CountMux);
-    *count = hwEncoderCount;
-    portEXIT_CRITICAL(&amt103CountMux);
-    return true;
-}
-
-bool readAmt103() {
-    if (!j4Zeroed) {
-        encoders[J4_INDEX].angleDeg = NAN;
-        encoders[J4_INDEX].valid = false;
-        return false;
-    }
-    int64_t count = 0;
-    if (!getAmt103Count(&count)) return false;
-    encoders[J4_INDEX].rawAngle = 0;
-    encoders[J4_INDEX].magneticStatus = 0;
-    encoders[J4_INDEX].valid = true;
-    encoders[J4_INDEX].angleDeg = static_cast<float>(count - j4ZeroCount) *
-                                  (360.0f / (AMT103_PPR * AMT103_QUADRATURE_FACTOR * J4_GEAR_RATIO)) *
-                                  ENCODER_DIRECTION_SIGN[J4_INDEX];
-    return true;
-}
-
 bool readEncoder(uint8_t index) {
     if (!encoderChannelConfigured(index) || !encoderPinsReady() || !encoderHardwareReady) return false;
-    if (index == J4_INDEX) return readAmt103();
     return readMt6701(index);
 }
 
@@ -464,7 +392,7 @@ void testAndDisplayEncoders() {
         return;
     }
     if (!encoderHardwareReady) {
-        Serial.println("[FAIL] Encoder hardware initialization failed; check mux and PCNT wiring.");
+        Serial.println("[FAIL] Encoder hardware initialization failed; check mux wiring.");
         Serial.println("==================================\n");
         return;
     }
@@ -476,21 +404,6 @@ void testAndDisplayEncoders() {
             Serial.printf("[SKIP] Joint %u: encoder disabled by bench mask\n", i);
             continue;
         }
-        if (i == J4_INDEX) {
-            int64_t count = 0;
-            if (getAmt103Count(&count)) {
-                ++passedCount;
-                Serial.printf("[OK] Joint %u (J4): software counter available, count=%lld, GPIO%u/GPIO%u\n",
-                              i, static_cast<long long>(count), AMT103_A_PIN, AMT103_B_PIN);
-            } else {
-                ++failedCount;
-                encoders[i].valid = false;
-                encoders[i].angleDeg = NAN;
-                Serial.printf("[FAIL] Joint %u (J4): software counter read failed\n", i);
-            }
-            continue;
-        }
-
         if (readEncoder(i)) {
             ++passedCount;
             Serial.printf("[OK] Joint %u: angle=%8.3f deg, mux channel=%u\n",
@@ -506,10 +419,8 @@ void testAndDisplayEncoders() {
     Serial.printf("Scan result: %u readable, %u failed\n", passedCount, failedCount);
     if (failedCount != 0) {
         Serial.println("Correct the reported issue and scan again; this diagnostic does not set a fault latch.");
-    } else if (!j4Zeroed) {
-        Serial.println("Interfaces initialized. Rotate J4 to verify counts change; align and send ZERO_J4 before arming.");
     } else {
-        Serial.println("Interfaces initialized. Rotate J4 to verify counts change; send CFG,I2C,1 after verification.");
+        Serial.println("Interfaces initialized. Verify J4 angle and send CFG,I2C,1 after verification.");
     }
     Serial.println("==================================\n");
 }
@@ -579,22 +490,6 @@ void processCommand(char *line) {
             if (motionPermitted()) Serial.println("ERR,SCAN_REQUIRES_DISARMED");
             else testAndDisplayEncoders();
             break;
-        case command_parser::CommandType::ZERO_J4: {
-            if (motionPermitted() || !encoderHardwareReady) {
-                Serial.println("ERR,J4_ZERO_STATE");
-                break;
-            }
-            int64_t count = 0;
-            if (!getAmt103Count(&count)) {
-                Serial.println("ERR,J4_COUNTER");
-                break;
-            }
-            j4ZeroCount = count;
-            j4Zeroed = true;
-            readAmt103();
-            Serial.println("OK,J4_ZEROED");
-            break;
-        }
         case command_parser::CommandType::BENCH: {
             if (!BENCH_TEST_MODE) {
                 Serial.println("ERR,BENCH_DISABLED");
@@ -848,8 +743,7 @@ void setup() {
             Wire.write(static_cast<uint8_t>(0));
             muxReady = Wire.endTransmission() == 0;
         }
-        const bool pcntReady = !encoderChannelConfigured(J4_INDEX) || initAmt103Pcnt();
-        encoderHardwareReady = muxReady && pcntReady;
+        encoderHardwareReady = muxReady;
         if (!encoderHardwareReady) Serial.println("ERR,ENCODER_INIT");
     }
     disableDrivers();
@@ -863,10 +757,9 @@ void setup() {
     if (BENCH_TEST_MODE) {
         Serial.println("BENCH mode: BENCH,<channel 0-6>,<signed steps/s>,<duration ms>; DISARM stops.");
         Serial.println("Legend: BENCH_TEL | JM1-JM7 = signed commanded STEP pulse totals; JE1-JE6 = encoder angles in degrees.");
-        Serial.println("JE shows NONE when an encoder is disabled, unavailable, or J4 has not been zeroed.");
-        Serial.println("Send ZERO_J4 at the J4 marker while disarmed; J4 angle is relative to that mark.");
+        Serial.println("JE shows NONE when an encoder is disabled or unavailable.");
     } else if (stepperTaskReady) {
-        Serial.println("POSE ready; align J4, ZERO_J4, verify encoders, CFG,I2C,1, CFG,CAL,1, ARM.");
+        Serial.println("POSE ready; verify encoders, CFG,I2C,1, CFG,CAL,1, ARM.");
     }
 }
 

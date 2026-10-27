@@ -12,7 +12,6 @@ enum class CommandType : uint8_t {
     HOST_ESTOP,
     GCODE_ESTOP,
     SCAN_ENCODERS,
-    ZERO_J4,
     BENCH,
     ARM,
     DISARM,

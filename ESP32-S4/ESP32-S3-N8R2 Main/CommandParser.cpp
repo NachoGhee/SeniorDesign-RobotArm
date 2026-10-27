@@ -38,7 +38,6 @@ ParsedCommand CommandParser::parse(char *line, const float currentTarget[JOINT_C
                                    const float currentAngles[JOINT_COUNT], bool targetActive) {
     if (strcmp(line, "X") == 0) return commandOf(CommandType::HOST_ESTOP);
     if (strcmp(line, "SCAN_ENCODERS") == 0) return commandOf(CommandType::SCAN_ENCODERS);
-    if (strcmp(line, "ZERO_J4") == 0) return commandOf(CommandType::ZERO_J4);
     if (strcmp(line, "ARM") == 0) return commandOf(CommandType::ARM);
     if (strcmp(line, "DISARM") == 0) return commandOf(CommandType::DISARM);
 
