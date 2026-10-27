@@ -24,7 +24,7 @@ constexpr bool BENCH_TEST_MODE = true;
 // Bit N enables motor channel N for bench commands; only enabled channels need pins.
 constexpr uint8_t BENCH_MOTOR_MASK = 0x7F;
 // Bit N enables encoder channel N; set to zero when testing motors without encoders.
-constexpr uint8_t BENCH_ENCODER_MASK = 0x3F;
+constexpr uint8_t BENCH_ENCODER_MASK = 0x00;
 constexpr uint8_t J4_INDEX = 3;
 constexpr float J4_GEAR_RATIO = 100.0f;
 constexpr float J4_BACKLASH_ARC_MIN = 22.0f;
@@ -327,8 +327,18 @@ bool selectMuxChannel(uint8_t channel) {
     return Wire.endTransmission() == 0;
 }
 
+bool initializeEncoderHardware() {
+    if (!encoderPinsReady()) return false;
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    Wire.setClock(400000);
+    Wire.beginTransmission(TCA9548A_ADDRESS);
+    Wire.write(static_cast<uint8_t>(0));
+    encoderHardwareReady = Wire.endTransmission() == 0;
+    return encoderHardwareReady;
+}
+
 bool readMt6701(uint8_t index) {
-    if (!encoderChannelConfigured(index) || !selectMuxChannel(MT6701_MUX_CHANNEL[index])) {
+    if (index >= JOINT_COUNT || !selectMuxChannel(MT6701_MUX_CHANNEL[index])) {
         if (index < JOINT_COUNT) {
             encoders[index].valid = false;
             encoders[index].angleDeg = NAN;
@@ -427,7 +437,7 @@ void stopAndLatch(const char *reason) {
 }
 
 void sendTelemetry() {
-    Serial.print("TEL | ");
+    Serial.print(BENCH_TEST_MODE ? "BENCH_TEL | " : "TEL | ");
     Serial.print((motionConfigReady() && motionPermitted() && allEncodersValid()) ? "ARMED | " : "DISARMED | ");
     Serial.printf("FAULT:0x%02X | ", faultMask);
 
@@ -453,7 +463,7 @@ void testAndDisplayEncoders() {
         Serial.println("==================================\n");
         return;
     }
-    if (!encoderHardwareReady) {
+    if (!encoderHardwareReady && !initializeEncoderHardware()) {
         Serial.println("[FAIL] Encoder hardware initialization failed; check mux wiring.");
         Serial.println("==================================\n");
         return;
@@ -462,11 +472,8 @@ void testAndDisplayEncoders() {
     uint8_t failedCount = 0;
     uint8_t passedCount = 0;
     for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
-        if (!encoderChannelConfigured(i)) {
-            Serial.printf("[SKIP] Joint %u: encoder disabled by bench mask\n", i);
-            continue;
-        }
-        if (readEncoder(i)) {
+        if (readMt6701(i)) {
+            if (i == J4_INDEX) updateJ4JointAngle();
             ++passedCount;
             Serial.printf("[OK] Joint %u: angle=%8.3f deg, mux channel=%u\n",
                           i, encoders[i].angleDeg, MT6701_MUX_CHANNEL[i]);
@@ -656,24 +663,27 @@ void processCommand(char *line) {
 void readSerial() {
     static char serialBuffer[160];
     static size_t serialLength = 0;
+    static bool previousWasCarriageReturn = false;
     while (Serial.available() > 0) {
         const char value = static_cast<char>(Serial.read());
-        if (value == '\r') continue;
-        if (value == '\n') {
+        if (value == '\n' && previousWasCarriageReturn) {
+            previousWasCarriageReturn = false;
+            continue;
+        }
+        if (value == '\r' || value == '\n') {
+            previousWasCarriageReturn = value == '\r';
             serialBuffer[serialLength] = '\0';
             if (serialLength > 0) {
-                
-                // --- NEW ECHO CODE ---
                 Serial.print("\n[RECEIVED COMMAND]: ");
                 Serial.println(serialBuffer);
-                // ---------------------
-                
                 processCommand(serialBuffer);
             }
             serialLength = 0;
         } else if (serialLength + 1 < sizeof(serialBuffer)) {
+            previousWasCarriageReturn = false;
             serialBuffer[serialLength++] = value;
         } else {
+            previousWasCarriageReturn = false;
             serialLength = 0;
             Serial.println("ERR,LINE_TOO_LONG");
         }
@@ -796,17 +806,9 @@ void setup() {
         attachInterrupt(digitalPinToInterrupt(LIMIT_SWITCH_PIN), limitSwitchISR, FALLING);
         if (digitalRead(LIMIT_SWITCH_PIN) == LOW) limitSwitchISR();
     }
-    if (encoderPinsReady() && (!BENCH_TEST_MODE || BENCH_ENCODER_MASK != 0)) {
-        bool muxReady = true;
-        if (muxEncoderConfigured()) {
-            Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-            Wire.setClock(400000);
-            Wire.beginTransmission(TCA9548A_ADDRESS);
-            Wire.write(static_cast<uint8_t>(0));
-            muxReady = Wire.endTransmission() == 0;
-        }
-        encoderHardwareReady = muxReady;
-        if (!encoderHardwareReady) Serial.println("ERR,ENCODER_INIT");
+    if (encoderPinsReady() && (!BENCH_TEST_MODE || BENCH_ENCODER_MASK != 0) &&
+        !initializeEncoderHardware()) {
+        Serial.println("ERR,ENCODER_INIT");
     }
     disableDrivers();
     if (armState == ArmState::BOOT) armState = ArmState::DISARMED;
