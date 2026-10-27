@@ -26,6 +26,11 @@ constexpr uint8_t BENCH_MOTOR_MASK = 0x7F;
 // Bit N enables encoder channel N; set to zero when testing motors without encoders.
 constexpr uint8_t BENCH_ENCODER_MASK = 0x3F;
 constexpr uint8_t J4_INDEX = 3;
+constexpr float J4_GEAR_RATIO = 100.0f;
+constexpr float J4_BACKLASH_ARC_MIN = 22.0f;
+constexpr float J4_BACKLASH_MOTOR_DEG = J4_BACKLASH_ARC_MIN * J4_GEAR_RATIO / 60.0f;
+// The single-turn motor encoder needs the arm placed at this known output pose at startup.
+constexpr float J4_STARTUP_ANGLE_DEG = 0.0f;
 constexpr uint8_t TCA9548A_ADDRESS = 0x70;
 constexpr uint8_t MT6701_I2C_ADDRESS = 0x06;
 constexpr uint8_t MT6701_ANGLE_REGISTER = 0x03;
@@ -111,13 +116,17 @@ struct StepperMotor {
 };
 
 EncoderState encoders[JOINT_COUNT];
+bool j4TrackerInitialized = false;
+float j4PreviousMotorAngleDeg = 0;
+float j4BacklashRemainingMotorDeg = 0;
+int8_t j4LastMotorDirection = 0;
 // Motor order: DM556 channels 1-4, then TMC2209 X/Y/Z; channels 1 and 2 both drive J2.
 StepperMotor motors[MOTOR_COUNT] = {
     {4, 5, -1, 0, 1, HIGH, LOW, 0, 0, 0},
     {6, 7, -1, 1, 1, HIGH, LOW, 0, 0, 0},
     {15, 16, -1, 1, -1, HIGH, LOW, 0, 0, 0},
     {17, 18, -1, 2, 1, HIGH, LOW, 0, 0, 0},
-    {8, 9, 14, 3, 1, HIGH, LOW, 0, 0, 0},
+    {8, 9, 14, 3, 1, HIGH, LOW, 0, 0, J4_GEAR_RATIO},
     {10, 11, 14, 4, 1, HIGH, LOW, 0, 0, 0},
     {12, 13, 14, 5, 1, HIGH, LOW, 0, 0, 0}
 };
@@ -328,13 +337,50 @@ bool readMt6701(uint8_t index) {
     float corrected = (rawDegrees - ENCODER_ZERO_DEG[index]) * ENCODER_DIRECTION_SIGN[index];
     while (corrected < 0) corrected += 360.0f;
     while (corrected >= 360.0f) corrected -= 360.0f;
-    encoders[index].angleDeg = corrected;
+    if (index != J4_INDEX) encoders[index].angleDeg = corrected;
     return true;
+}
+
+float signedAngleDeltaDeg(float angleDeg) {
+    while (angleDeg > 180.0f) angleDeg -= 360.0f;
+    while (angleDeg < -180.0f) angleDeg += 360.0f;
+    return angleDeg;
+}
+
+void updateJ4JointAngle() {
+    const float motorAngleDeg = encoders[J4_INDEX].rawAngle * (360.0f / 16384.0f);
+    if (!j4TrackerInitialized) {
+        const float startupPhaseError = signedAngleDeltaDeg(
+            motorAngleDeg - ENCODER_ZERO_DEG[J4_INDEX]) * ENCODER_DIRECTION_SIGN[J4_INDEX];
+        encoders[J4_INDEX].angleDeg = J4_STARTUP_ANGLE_DEG + startupPhaseError / J4_GEAR_RATIO;
+        j4PreviousMotorAngleDeg = motorAngleDeg;
+        j4TrackerInitialized = true;
+        return;
+    }
+
+    const float motorDeltaDeg = signedAngleDeltaDeg(motorAngleDeg - j4PreviousMotorAngleDeg) *
+                                ENCODER_DIRECTION_SIGN[J4_INDEX];
+    j4PreviousMotorAngleDeg = motorAngleDeg;
+    if (motorDeltaDeg == 0) return;
+
+    const int8_t direction = motorDeltaDeg > 0 ? 1 : -1;
+    if (direction != j4LastMotorDirection) {
+        j4LastMotorDirection = direction;
+        j4BacklashRemainingMotorDeg = J4_BACKLASH_MOTOR_DEG;
+    }
+
+    const float motorTravelDeg = fabsf(motorDeltaDeg);
+    const float backlashTakenUpDeg = fminf(motorTravelDeg, j4BacklashRemainingMotorDeg);
+    j4BacklashRemainingMotorDeg -= backlashTakenUpDeg;
+    const float outputDeltaDeg = (motorTravelDeg - backlashTakenUpDeg) * direction / J4_GEAR_RATIO;
+    encoders[J4_INDEX].angleDeg += outputDeltaDeg;
 }
 
 bool readEncoder(uint8_t index) {
     if (!encoderChannelConfigured(index) || !encoderPinsReady() || !encoderHardwareReady) return false;
-    return readMt6701(index);
+    if (!readMt6701(index)) return false;
+    if (index == J4_INDEX) updateJ4JointAngle();
+    return true;
 }
 
 /**
