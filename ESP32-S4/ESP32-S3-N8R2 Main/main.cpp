@@ -78,9 +78,9 @@ volatile ArmState armState = ArmState::BOOT;
 
 const float ENCODER_ZERO_DEG[JOINT_COUNT] = {0, 0, 0, 0, 0, 0};
 const int8_t ENCODER_DIRECTION_SIGN[JOINT_COUNT] = {1, 1, 1, 1, 1, 1};
-const float JOINT_MIN_DEG[JOINT_COUNT] = {0, 0, 0, 0, 0, 0};
-const float JOINT_MAX_DEG[JOINT_COUNT] = {0, 0, 0, 0, 0, 0};
-const float MAX_JOINT_SPEED_DEG_S[JOINT_COUNT] = {0, 0, 0, 0, 0, 0};
+const float JOINT_MIN_DEG[JOINT_COUNT] = {-30, -30, -30, -30, -30, -30};
+const float JOINT_MAX_DEG[JOINT_COUNT] = {30, 30, 30, 30, 30, 30};
+const float MAX_JOINT_SPEED_DEG_S[JOINT_COUNT] = {5, 5, 5, 5, 5, 5};
 const float POSITION_KP_PER_S[JOINT_COUNT] = {1, 1, 1, 1, 1, 1};
 
 struct EncoderState {
@@ -185,13 +185,11 @@ bool validPin(int8_t pin) {
 }
 
 bool motorChannelConfigured(uint8_t index) {
-    return index < MOTOR_COUNT &&
-           (!BENCH_TEST_MODE || (BENCH_MOTOR_MASK & (1U << index)) != 0);
+    return index < MOTOR_COUNT && (BENCH_MOTOR_MASK & (1U << index)) != 0;
 }
 
 bool encoderChannelConfigured(uint8_t index) {
-    return index < JOINT_COUNT &&
-           (!BENCH_TEST_MODE || (BENCH_ENCODER_MASK & (1U << index)) != 0);
+    return index < JOINT_COUNT && (BENCH_ENCODER_MASK & (1U << index)) != 0;
 }
 
 bool muxEncoderConfigured() {
@@ -243,10 +241,12 @@ bool benchConfigReady() {
 
 bool calibrationValuesReady() {
     for (uint8_t i = 0; i < JOINT_COUNT; ++i) {
+        if (!encoderChannelConfigured(i)) continue;
         if (JOINT_MIN_DEG[i] >= JOINT_MAX_DEG[i] || MAX_JOINT_SPEED_DEG_S[i] <= 0 ||
             (ENCODER_DIRECTION_SIGN[i] != 1 && ENCODER_DIRECTION_SIGN[i] != -1)) return false;
     }
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+        if (!motorChannelConfigured(i)) continue;
         if (motors[i].fullStepsPerRev <= 0 || motors[i].microsteps <= 0 || motors[i].gearRatio <= 0 ||
             motors[i].joint >= JOINT_COUNT ||
             (motors[i].directionSign != 1 && motors[i].directionSign != -1)) return false;
@@ -708,8 +708,9 @@ void updatePositionController() {
         return;
     }
 
-    float jointSpeedDegS[JOINT_COUNT];
+    float jointSpeedDegS[JOINT_COUNT] = {0};
     for (uint8_t j = 0; j < JOINT_COUNT; ++j) {
+        if (!encoderChannelConfigured(j)) continue;
         const float error = targetDeg[j] - encoders[j].angleDeg;
         const float limit = MAX_JOINT_SPEED_DEG_S[j];
         jointSpeedDegS[j] = constrain(error * POSITION_KP_PER_S[j], -limit, limit);
@@ -717,6 +718,7 @@ void updatePositionController() {
             (encoders[j].angleDeg >= JOINT_MAX_DEG[j] && jointSpeedDegS[j] > 0)) jointSpeedDegS[j] = 0;
     }
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+        if (!motorChannelConfigured(i)) continue;
         const uint8_t joint = motors[i].joint;
         const float stepsPerDegree = motors[i].fullStepsPerRev * motors[i].microsteps *
                          motors[i].gearRatio / 360.0f;
