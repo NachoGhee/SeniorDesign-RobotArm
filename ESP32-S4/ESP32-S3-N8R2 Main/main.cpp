@@ -153,7 +153,7 @@ uint32_t lastSensorUs = 0;
 uint32_t lastTelemetryMs = 0;
 uint32_t commandSequence = 0;
 volatile bool stepperTaskReady = false;
-volatile int8_t benchMotorIndex = -1;
+volatile uint8_t benchMotorMask = 0;
 volatile bool limitSwitchTriggered = false;
 uint32_t benchStopAtMs = 0;
 uint32_t emergencyDisableSetLow = 0;
@@ -269,7 +269,7 @@ bool allEncodersValid() {
 }
 
 void disableDrivers() {
-    benchMotorIndex = -1;
+    benchMotorMask = 0;
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
         motors[i].stepsPerSecond = 0;
         if (motorChannelConfigured(i) && validPin(motors[i].enablePin)) {
@@ -281,7 +281,7 @@ void disableDrivers() {
 void enableDrivers() {
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
         if (motorChannelConfigured(i) && validPin(motors[i].enablePin) &&
-            (!BENCH_TEST_MODE || i == benchMotorIndex)) {
+            (!BENCH_TEST_MODE || (benchMotorMask & (1U << i)) != 0)) {
             digitalWrite(motors[i].enablePin, motors[i].enableActiveLevel);
         }
     }
@@ -564,7 +564,9 @@ void processCommand(char *line) {
                 Serial.println("ERR,BENCH_DISABLED");
                 break;
             }
-            if (!motorChannelConfigured(static_cast<uint8_t>(command.channel))) {
+            const bool allMotors = command.channel == command_parser::BENCH_ALL_MOTORS_CHANNEL;
+            if ((allMotors && (BENCH_MOTOR_MASK & 0x7F) != 0x7F) ||
+                (!allMotors && !motorChannelConfigured(static_cast<uint8_t>(command.channel)))) {
                 Serial.println("ERR,BENCH_CHANNEL");
                 break;
             }
@@ -589,8 +591,11 @@ void processCommand(char *line) {
                 break;
             }
             disableDrivers();
-            benchMotorIndex = static_cast<int8_t>(command.channel);
-            motors[command.channel].stepsPerSecond = static_cast<float>(command.rate);
+            benchMotorMask = allMotors ? 0x7F : static_cast<uint8_t>(1U << command.channel);
+            for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+                motors[i].stepsPerSecond = (benchMotorMask & (1U << i)) != 0
+                    ? static_cast<float>(command.rate) : 0;
+            }
             armState = ArmState::BENCH_MOTION;
             lastCommandMs = millis();
             benchStopAtMs = lastCommandMs + command.durationMs;
@@ -731,7 +736,8 @@ void updateMotorOutputs() {
         if (motor.stepHigh && static_cast<uint32_t>(now - motor.stepRiseUs) >= STEP_PULSE_US) {
             motor.setStepLow();
         }
-        if (!motorChannelConfigured(i) || (BENCH_TEST_MODE && i != benchMotorIndex)) continue;
+        if (!motorChannelConfigured(i) ||
+            (BENCH_TEST_MODE && (benchMotorMask & (1U << i)) == 0)) continue;
         if (!targetActive() || faultMask != 0) continue;
         const float rate = motors[i].stepsPerSecond;
         if (fabsf(rate) < 1.0f || motor.stepHigh) continue;
@@ -819,7 +825,7 @@ void setup() {
         Serial.println("ERR,STEPPER_TASK_CREATE");
     }
     if (BENCH_TEST_MODE) {
-        Serial.println("BENCH mode: BENCH,<channel 0-6>,<signed steps/s>,<duration ms>; DISARM stops.");
+        Serial.println("BENCH mode: BENCH,<channel 0-6 or 9>,<signed steps/s>,<duration ms>; channel 9 selects all motors; DISARM stops.");
         Serial.println("Legend: BENCH_TEL | JM1-JM7 = signed commanded STEP pulse totals; JE1-JE6 = encoder angles in degrees.");
         Serial.println("JE shows NONE when an encoder is disabled or unavailable.");
     } else if (stepperTaskReady) {

@@ -32,6 +32,15 @@ bool parseGcodeInteger(const char *word, char prefix, int *value) {
     return true;
 }
 
+bool startsWithIgnoreCase(const char *text, const char *prefix) {
+    while (*prefix != '\0') {
+        if (*text == '\0' || toupper(static_cast<unsigned char>(*text)) != *prefix) return false;
+        ++text;
+        ++prefix;
+    }
+    return true;
+}
+
 }
 
 ParsedCommand CommandParser::parse(char *line, const float currentTarget[JOINT_COUNT],
@@ -41,7 +50,7 @@ ParsedCommand CommandParser::parse(char *line, const float currentTarget[JOINT_C
     if (strcmp(line, "ARM") == 0) return commandOf(CommandType::ARM);
     if (strcmp(line, "DISARM") == 0) return commandOf(CommandType::DISARM);
 
-    if (strncmp(line, "BENCH,", 6) == 0) {
+    if (startsWithIgnoreCase(line, "BENCH,")) {
         char *save = nullptr;
         strtok_r(line, ",", &save);
         char *channelField = strtok_r(nullptr, ",", &save);
@@ -52,7 +61,8 @@ ParsedCommand CommandParser::parse(char *line, const float currentTarget[JOINT_C
 
         char *end = nullptr;
         const long channel = strtol(channelField, &end, 10);
-        if (end == channelField || *end != '\0' || channel < 0 || channel >= MOTOR_COUNT) {
+        if (end == channelField || *end != '\0' || channel < 0 ||
+            (channel >= MOTOR_COUNT && channel != BENCH_ALL_MOTORS_CHANNEL)) {
             return invalid("ERR,BENCH_CHANNEL");
         }
         end = nullptr;
