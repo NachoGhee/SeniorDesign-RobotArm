@@ -12,11 +12,11 @@
 constexpr uint8_t JOINT_COUNT = 6;
 constexpr uint8_t MOTOR_COUNT = 7;
 constexpr uint32_t SERIAL_BAUD = 115200;
-constexpr uint32_t COMMAND_TIMEOUT_MS = 500;
+constexpr uint32_t COMMAND_TIMEOUT_MS = 50000;
 constexpr uint32_t SENSOR_PERIOD_US = 5000;
 constexpr uint32_t TELEMETRY_PERIOD_MS = 100;
 constexpr uint32_t STEP_PULSE_US = 15;
-constexpr float MAX_STEP_RATE = 10000.0f;
+constexpr float MAX_STEP_RATE = 20000.0f;
 constexpr uint32_t STEPPER_TASK_STACK_BYTES = 4096;
 constexpr UBaseType_t STEPPER_TASK_PRIORITY = 3;
 constexpr BaseType_t STEPPER_TASK_CORE = 0;
@@ -24,7 +24,7 @@ constexpr bool BENCH_TEST_MODE = true;
 // Bit N enables motor channel N for bench commands; only enabled channels need pins.
 constexpr uint8_t BENCH_MOTOR_MASK = 0x7F;
 // Bit N enables encoder channel N; set to zero when testing motors without encoders.
-constexpr uint8_t BENCH_ENCODER_MASK = 0x01;
+constexpr uint8_t BENCH_ENCODER_MASK = 0x00;
 constexpr uint8_t J4_INDEX = 3;
 constexpr float J4_GEAR_RATIO = 100.0f;
 constexpr float J4_BACKLASH_ARC_MIN = 22.0f;
@@ -34,7 +34,7 @@ constexpr float J4_STARTUP_ANGLE_DEG = 0.0f;
 constexpr uint8_t TCA9548A_ADDRESS = 0x70;
 constexpr uint8_t MT6701_I2C_ADDRESS = 0x06;
 constexpr uint8_t MT6701_ANGLE_REGISTER = 0x03;
-constexpr uint8_t MT6701_MUX_CHANNEL[JOINT_COUNT] = {0, 1, 2, 3, 4, 5};
+constexpr uint8_t MT6701_MUX_CHANNEL[JOINT_COUNT] = {2, 3, 4, 5, 6, 7};
 constexpr float DM556_PULSES_PER_REV = 1600.0f;
 constexpr int8_t DM556_LJ2_STEP_PIN = 4;
 constexpr int8_t DM556_LJ2_DIR_PIN = 5;
@@ -78,9 +78,9 @@ volatile ArmState armState = ArmState::BOOT;
 
 const float ENCODER_ZERO_DEG[JOINT_COUNT] = {0, 0, 0, 0, 0, 0};
 const int8_t ENCODER_DIRECTION_SIGN[JOINT_COUNT] = {1, 1, 1, 1, 1, 1};
-const float JOINT_MIN_DEG[JOINT_COUNT] = {-30, -30, -30, -30, -30, -30};
-const float JOINT_MAX_DEG[JOINT_COUNT] = {30, 30, 30, 30, 30, 30};
-const float MAX_JOINT_SPEED_DEG_S[JOINT_COUNT] = {5, 5, 5, 5, 5, 5};
+const float JOINT_MIN_DEG[JOINT_COUNT] = {-30, 0, -30, -30, -30, -30};
+const float JOINT_MAX_DEG[JOINT_COUNT] = {30, 359, 30, 30, 30, 30};
+const float MAX_JOINT_SPEED_DEG_S[JOINT_COUNT] = {5, 10, 5, 5, 5, 5};
 const float POSITION_KP_PER_S[JOINT_COUNT] = {1, 1, 1, 1, 1, 1};
 
 struct EncoderState {
@@ -138,8 +138,8 @@ float j4BacklashRemainingMotorDeg = 0;
 int8_t j4LastMotorDirection = 0;
 // Motor channels: LJ2, RJ2, turret J1, then TMC2209 J6, J3, J4, J5.
 StepperMotor motors[MOTOR_COUNT] = {
-    {DM556_LJ2_STEP_PIN, DM556_LJ2_DIR_PIN, -1, 1, 1, HIGH, LOW, DM556_PULSES_PER_REV, 1, 0},
-    {DM556_RJ2_STEP_PIN, DM556_RJ2_DIR_PIN, -1, 1, -1, HIGH, LOW, DM556_PULSES_PER_REV, 1, 0},
+    {DM556_LJ2_STEP_PIN, DM556_LJ2_DIR_PIN, -1, 1, 1, HIGH, LOW, DM556_PULSES_PER_REV, 1, 130.302f},
+    {DM556_RJ2_STEP_PIN, DM556_RJ2_DIR_PIN, -1, 1, 1, HIGH, LOW, DM556_PULSES_PER_REV, 1, 130.302f},
     {DM556_TURRET_J1_STEP_PIN, DM556_TURRET_J1_DIR_PIN, -1, 0, -1, HIGH, LOW, DM556_PULSES_PER_REV, 1, 0},
     {TMC2209_J6_STEP_PIN, TMC2209_J6_DIR_PIN, CNC_SHIELD_ENABLE_PIN, 5, 1, HIGH, LOW, 0, 0, 0},
     {TMC2209_J3_STEP_PIN, TMC2209_J3_DIR_PIN, CNC_SHIELD_ENABLE_PIN, 2, 1, HIGH, LOW, 0, 0, 0},
