@@ -62,7 +62,8 @@ ParsedCommand CommandParser::parse(char *line, const float currentTarget[JOINT_C
         char *end = nullptr;
         const long channel = strtol(channelField, &end, 10);
         if (end == channelField || *end != '\0' || channel < 0 ||
-            (channel >= MOTOR_COUNT && channel != BENCH_ALL_MOTORS_CHANNEL)) {
+            (channel >= MOTOR_COUNT && channel != BENCH_JOINT_2_CHANNEL &&
+             channel != BENCH_ALL_MOTORS_CHANNEL)) {
             return invalid("ERR,BENCH_CHANNEL");
         }
         end = nullptr;

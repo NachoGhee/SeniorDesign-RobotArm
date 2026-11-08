@@ -11,6 +11,7 @@
 
 constexpr uint8_t JOINT_COUNT = 6;
 constexpr uint8_t MOTOR_COUNT = 7;
+constexpr uint8_t BENCH_JOINT_2_MOTOR_MASK = (1U << 1) | (1U << 2);
 constexpr uint32_t SERIAL_BAUD = 115200;
 constexpr uint32_t COMMAND_TIMEOUT_MS = 50000;
 constexpr uint32_t SENSOR_PERIOD_US = 5000;
@@ -136,14 +137,20 @@ bool j4TrackerInitialized = false;
 float j4PreviousMotorAngleDeg = 0;
 float j4BacklashRemainingMotorDeg = 0;
 int8_t j4LastMotorDirection = 0;
-// Motor channels: LJ2, RJ2, turret J1, then TMC2209 J6, J3, J4, J5.
 StepperMotor motors[MOTOR_COUNT] = {
-    {DM556_LJ2_STEP_PIN, DM556_LJ2_DIR_PIN, -1, 1, 1, HIGH, LOW, DM556_PULSES_PER_REV, 1, 130.302f},
-    {DM556_RJ2_STEP_PIN, DM556_RJ2_DIR_PIN, -1, 1, 1, HIGH, LOW, DM556_PULSES_PER_REV, 1, 130.302f},
+    // 0: Turret J1 (jointIndex = 0)
     {DM556_TURRET_J1_STEP_PIN, DM556_TURRET_J1_DIR_PIN, -1, 0, -1, HIGH, LOW, DM556_PULSES_PER_REV, 1, 0},
+    // 1: LJ2 (jointIndex = 1)
+    {DM556_LJ2_STEP_PIN, DM556_LJ2_DIR_PIN, -1, 1, 1, HIGH, LOW, DM556_PULSES_PER_REV, 1, 130.302f},
+    // 2: RJ2 (jointIndex = 1)
+    {DM556_RJ2_STEP_PIN, DM556_RJ2_DIR_PIN, -1, 1, 1, HIGH, LOW, DM556_PULSES_PER_REV, 1, 130.302f},
+    // 3: J6 (jointIndex = 5)
     {TMC2209_J6_STEP_PIN, TMC2209_J6_DIR_PIN, CNC_SHIELD_ENABLE_PIN, 5, 1, HIGH, LOW, 0, 0, 0},
+    // 4: J3 (jointIndex = 2)
     {TMC2209_J3_STEP_PIN, TMC2209_J3_DIR_PIN, CNC_SHIELD_ENABLE_PIN, 2, 1, HIGH, LOW, 0, 0, 0},
+    // 5: J4 (jointIndex = 3)
     {TMC2209_J4_STEP_PIN, TMC2209_J4_DIR_PIN, CNC_SHIELD_ENABLE_PIN, 3, 1, HIGH, LOW, 0, 0, J4_GEAR_RATIO},
+    // 6: J5 (jointIndex = 4)
     {TMC2209_J5_STEP_PIN, TMC2209_J5_DIR_PIN, CNC_SHIELD_ENABLE_PIN, 4, 1, HIGH, LOW, 0, 0, 0}
 };
 float targetDeg[JOINT_COUNT] = {0, 0, 0, 0, 0, 0};
@@ -565,8 +572,12 @@ void processCommand(char *line) {
                 break;
             }
             const bool allMotors = command.channel == command_parser::BENCH_ALL_MOTORS_CHANNEL;
+            const bool joint2Motors = command.channel == command_parser::BENCH_JOINT_2_CHANNEL;
             if ((allMotors && (BENCH_MOTOR_MASK & 0x7F) != 0x7F) ||
-                (!allMotors && !motorChannelConfigured(static_cast<uint8_t>(command.channel)))) {
+                (joint2Motors && (BENCH_MOTOR_MASK & BENCH_JOINT_2_MOTOR_MASK) !=
+                                     BENCH_JOINT_2_MOTOR_MASK) ||
+                (!allMotors && !joint2Motors &&
+                 !motorChannelConfigured(static_cast<uint8_t>(command.channel)))) {
                 Serial.println("ERR,BENCH_CHANNEL");
                 break;
             }
@@ -591,7 +602,8 @@ void processCommand(char *line) {
                 break;
             }
             disableDrivers();
-            benchMotorMask = allMotors ? 0x7F : static_cast<uint8_t>(1U << command.channel);
+            benchMotorMask = allMotors ? 0x7F : joint2Motors ? BENCH_JOINT_2_MOTOR_MASK
+                                                              : static_cast<uint8_t>(1U << command.channel);
             for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
                 motors[i].stepsPerSecond = (benchMotorMask & (1U << i)) != 0
                     ? static_cast<float>(command.rate) : 0;
@@ -827,7 +839,7 @@ void setup() {
         Serial.println("ERR,STEPPER_TASK_CREATE");
     }
     if (BENCH_TEST_MODE) {
-        Serial.println("BENCH mode: BENCH,<channel 0-6 or 9>,<signed steps/s>,<duration ms>; channel 9 selects all motors; DISARM stops.");
+        Serial.println("BENCH mode: BENCH,<channel 0-6, 8, or 9>,<signed steps/s>,<duration ms>; channel 8 selects J2 motors 1+2, 9 selects all; DISARM stops.");
         Serial.println("Legend: BENCH_TEL | JM1-JM7 = signed commanded STEP pulse totals; JE1-JE6 = encoder angles in degrees.");
         Serial.println("JE shows NONE when an encoder is disabled or unavailable.");
     } else if (stepperTaskReady) {

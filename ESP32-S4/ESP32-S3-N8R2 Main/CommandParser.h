@@ -6,6 +6,7 @@ namespace command_parser {
 
 constexpr uint8_t JOINT_COUNT = 6;
 constexpr uint8_t MOTOR_COUNT = 7;
+constexpr int BENCH_JOINT_2_CHANNEL = 8;
 constexpr int BENCH_ALL_MOTORS_CHANNEL = 9;
 
 enum class CommandType : uint8_t {
