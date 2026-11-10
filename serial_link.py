@@ -10,9 +10,13 @@ class SerialConnection:
     def __init__(self, port_name, baud_rate=115200):
         self.port = serial.Serial(port_name, baud_rate, timeout=0)
         self.receive_buffer = bytearray()
+        self.last_tx_command = "NONE"
+        self.last_rx_reply = "NONE"
 
     def _read_lines(self):
-        self.receive_buffer.extend(self.port.read(self.port.in_waiting))
+        waiting = self.port.in_waiting
+        if waiting > 0:
+            self.receive_buffer.extend(self.port.read(waiting))
         while b"\n" in self.receive_buffer:
             raw_line, _, remainder = self.receive_buffer.partition(b"\n")
             self.receive_buffer[:] = remainder
@@ -21,14 +25,17 @@ class SerialConnection:
     def read_telemetry(self):
         latest = None
         for line in self._read_lines():
+            if not line or line.startswith("[RECEIVED COMMAND]"):
+                continue
             telemetry = parse_telemetry_line(line)
             if telemetry is not None:
                 latest = telemetry
-            elif line.startswith(("ERR,", "FAULT,")):
-                print(line)
+            else:
+                self.last_rx_reply = line
         return latest
 
     def send_command(self, command):
+        self.last_tx_command = command
         self.port.write((command + "\n").encode("ascii"))
 
     def send_gcode_line(self, command, timeout_s=2.0):
@@ -36,14 +43,18 @@ class SerialConnection:
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             for line in self._read_lines():
+                if not line or line.startswith("[RECEIVED COMMAND]"):
+                    continue
                 telemetry = parse_telemetry_line(line)
                 if telemetry is not None:
                     if telemetry["faults"]:
                         raise RuntimeError(f"Encoder fault mask: 0x{telemetry['faults']:02X}")
-                elif line == "ok" or line.startswith("OK,"):
-                    return
-                elif line.startswith(("ERR,", "FAULT,")):
-                    raise RuntimeError(line)
+                else:
+                    self.last_rx_reply = line
+                    if line == "ok" or line.startswith("OK,"):
+                        return
+                    if line.startswith(("ERR,", "FAULT,")):
+                        raise RuntimeError(line)
             time.sleep(0.005)
         raise TimeoutError(f"Timed out waiting for acknowledgement to: {command}")
 
