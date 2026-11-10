@@ -57,7 +57,7 @@ def main(argv=None):
         connection.close()
         return 1
 
-    screen = pygame.display.set_mode((760, 420))
+    screen = pygame.display.set_mode((760, 460))
     pygame.display.set_caption("POSE Arm Kinematics & Telemetry HUD")
     font = pygame.font.SysFont("consolas", 15)
 
@@ -84,6 +84,8 @@ def main(argv=None):
     last_j4_jog_rate = 0
     last_j4_jog_send = 0.0
     last_hud_draw = 0.0
+    last_controller_button = "None"
+    last_controller_button_time = 0.0
     last_not_ready_message = False
     last_ik_error_time = 0.0
     clock = pygame.time.Clock()
@@ -127,6 +129,29 @@ def main(argv=None):
                     print("J4 calibration mode: align the witness marks, then press START or A.")
 
             now = time.monotonic()
+            button_inputs = [
+                control for control in gamepad_update.active_controls
+                if "m/s" not in control and "steps/s" not in control
+            ]
+            if button_inputs:
+                last_controller_button = " | ".join(button_inputs)
+                last_controller_button_time = now
+
+            if j4_calibration_mode:
+                movement_inputs = []
+                if gamepad_update.j4_jog_rate != 0:
+                    movement_inputs.append(
+                        f"{gamepad_update.j4_jog_source} -> J4 "
+                        f"{gamepad_update.j4_jog_rate:+d} steps/s"
+                    )
+            else:
+                movement_inputs = [
+                    control for control in gamepad_update.active_controls
+                    if "m/s" in control and "steps/s" not in control
+                ]
+            if now - last_controller_button_time < 1.0:
+                movement_inputs.append(last_controller_button)
+            last_controller_input = " | ".join(movement_inputs) if movement_inputs else "None"
             telemetry = connection.read_telemetry()
             if telemetry is not None:
                 last_telemetry_time = now
@@ -271,15 +296,21 @@ def main(argv=None):
                     row = f"{label}: {measured_text} -> {target_text} deg"
                     screen.blit(font.render(row, True, (235, 235, 235)), (390, 98 + index * 25))
 
+                input_text = last_controller_input
+                screen.blit(font.render(f"INPUT IN USE: {input_text}", True, (255, 215, 120)), (16, 265))
+                screen.blit(font.render("Cartesian: LS X/Y + RS Y -> XYZ", True, (190, 195, 205)), (16, 288))
+                screen.blit(font.render("J4: LS Y coarse | D-pad / LB / RB fine", True, (190, 195, 205)), (16, 308))
+                screen.blit(font.render("BACK: calibration | START/A: zero", True, (190, 195, 205)), (390, 288))
+                screen.blit(font.render("B: E-stop | D: disarm | S/C: setup", True, (190, 195, 205)), (390, 308))
+
                 if target_pose is not None:
                     x_mm, y_mm, z_mm = target_pose[:3, 3] * 1000.0
                     xyz_text = f"Cartesian target (mm): X={x_mm:7.2f}  Y={y_mm:7.2f}  Z={z_mm:7.2f}"
                 else:
                     xyz_text = "Cartesian target (mm): waiting for valid telemetry"
-                screen.blit(font.render(xyz_text, True, (255, 220, 120)), (16, 290))
-                screen.blit(font.render(f"Last TX: {connection.last_tx_command}", True, (180, 230, 180)), (16, 330))
-                screen.blit(font.render(f"Last ESP32 reply: {connection.last_rx_reply}", True, (230, 190, 160)), (16, 355))
-                screen.blit(font.render("Press START/A to zero J4 during calibration", True, (170, 175, 185)), (16, 390))
+                screen.blit(font.render(xyz_text, True, (255, 220, 120)), (16, 340))
+                screen.blit(font.render(f"Last TX: {connection.last_tx_command}", True, (180, 230, 180)), (16, 372))
+                screen.blit(font.render(f"Last ESP32 reply: {connection.last_rx_reply}", True, (230, 190, 160)), (16, 397))
                 pygame.display.flip()
 
     except KeyboardInterrupt:

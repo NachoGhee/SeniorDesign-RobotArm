@@ -5,6 +5,7 @@ import pygame
 
 DEADZONE = 0.15
 CARTESIAN_AXIS_TO_XYZ = {0: 0, 1: 1, 4: 2}
+CARTESIAN_AXIS_LABELS = {0: "LS X", 1: "LS Y", 4: "RS Y"}
 CARTESIAN_AXIS_SIGN = {0: 1, 1: -1, 4: 1}
 CARTESIAN_SPEED_M_S = (0.10, 0.10, 0.10)
 ESTOP_BUTTON = 1
@@ -26,6 +27,8 @@ class GamepadUpdate:
     j4_calibration_toggle: bool = False
     j4_calibration_confirm: bool = False
     j4_jog_rate: int = 0
+    j4_jog_source: str = "NONE"
+    active_controls: tuple = ()
 
 
 def apply_deadzone(value):
@@ -47,6 +50,7 @@ class GamepadController:
     def poll(self):
         quit_requested = False
         actions = []
+        active_controls = []
         j4_calibration_toggle = False
         j4_calibration_confirm = False
         for event in pygame.event.get():
@@ -55,23 +59,31 @@ class GamepadController:
             elif event.type == pygame.JOYBUTTONDOWN:
                 if event.button == ESTOP_BUTTON:
                     actions.append("estop")
+                    active_controls.append("B / button 1: E-stop")
                 elif event.button == J4_BACK_BUTTON:
                     j4_calibration_toggle = True
+                    active_controls.append("BACK/SELECT: toggle J4 calibration")
                 elif event.button == J4_A_BUTTON:
                     j4_calibration_confirm = True
+                    active_controls.append("A: confirm J4 zero")
                 elif event.button == START_INIT_BUTTON:
                     actions.append("confirm_i2c")
                     actions.append("confirm_calibration")
                     j4_calibration_confirm = True
+                    active_controls.append("START: confirm J4 zero / setup")
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_s:
                     actions.append("confirm_i2c")
+                    active_controls.append("Key S: confirm I2C")
                 elif event.key == pygame.K_c:
                     actions.append("confirm_calibration")
+                    active_controls.append("Key C: confirm calibration")
                 elif event.key == pygame.K_a:
                     actions.append("arm")
+                    active_controls.append("Key A: arm")
                 elif event.key == pygame.K_d:
                     actions.append("disarm")
+                    active_controls.append("Key D: disarm")
 
         velocity = [0.0, 0.0, 0.0]
         for axis, coordinate in CARTESIAN_AXIS_TO_XYZ.items():
@@ -81,22 +93,32 @@ class GamepadController:
             velocity[coordinate] = (
                 value * CARTESIAN_AXIS_SIGN[axis] * CARTESIAN_SPEED_M_S[coordinate]
             )
+            if value != 0:
+                active_controls.append(
+                    f"{CARTESIAN_AXIS_LABELS[axis]} {velocity[coordinate]:+.2f} m/s"
+                )
 
         jog_axis = self.joystick.get_axis(J4_JOG_AXIS) if J4_JOG_AXIS < self.joystick.get_numaxes() else 0.0
         jog_rate = int(round(-apply_deadzone(jog_axis) * J4_JOG_MAX_RATE))
+        j4_jog_source = "LS Y" if jog_rate != 0 else "NONE"
         hat_y = self.joystick.get_hat(0)[1] if self.joystick.get_numhats() > 0 else 0
         if hat_y != 0:
             jog_rate = J4_FINE_JOG_RATE if hat_y > 0 else -J4_FINE_JOG_RATE
+            j4_jog_source = "D-PAD UP" if hat_y > 0 else "D-PAD DOWN"
         elif self.joystick.get_numbuttons() > max(J4_LEFT_BUMPER, J4_RIGHT_BUMPER):
             bumper_direction = int(self.joystick.get_button(J4_RIGHT_BUMPER)) - int(
                 self.joystick.get_button(J4_LEFT_BUMPER)
             )
             if bumper_direction != 0:
                 jog_rate = J4_FINE_JOG_RATE if bumper_direction > 0 else -J4_FINE_JOG_RATE
+                j4_jog_source = "RB" if bumper_direction > 0 else "LB"
+
+        if jog_rate != 0:
+            active_controls.append(f"{j4_jog_source} -> J4 {jog_rate:+d} steps/s")
 
         return GamepadUpdate(
             quit_requested, tuple(actions), tuple(velocity), j4_calibration_toggle,
-            j4_calibration_confirm, jog_rate
+            j4_calibration_confirm, jog_rate, j4_jog_source, tuple(active_controls)
         )
 
     def get_name(self):
