@@ -10,6 +10,7 @@ namespace {
 
 constexpr long BENCH_MAX_STEPS_PER_SECOND = 10000;
 constexpr long BENCH_MAX_DURATION_MS = 5000;
+constexpr float JOG_MAX_STEPS_PER_SECOND = 20000.0f;
 
 ParsedCommand invalid(const char *error) {
     ParsedCommand command;
@@ -49,6 +50,38 @@ ParsedCommand CommandParser::parse(char *line, const float currentTarget[JOINT_C
     if (strcmp(line, "SCAN_ENCODERS") == 0) return commandOf(CommandType::SCAN_ENCODERS);
     if (strcmp(line, "ARM") == 0) return commandOf(CommandType::ARM);
     if (strcmp(line, "DISARM") == 0) return commandOf(CommandType::DISARM);
+    if (strcmp(line, "ZERO4") == 0) return commandOf(CommandType::ZERO_J4);
+
+    if (startsWithIgnoreCase(line, "JOG4,")) {
+        const size_t lineLength = strlen(line);
+        if (line[lineLength - 1] == ',' || strstr(line, ",,") != nullptr) {
+            return invalid("ERR,JOG4_FORMAT");
+        }
+        char *save = nullptr;
+        strtok_r(line, ",", &save);
+        char *rateField = strtok_r(nullptr, ",", &save);
+        char *durationField = strtok_r(nullptr, ",", &save);
+        if (rateField == nullptr || durationField == nullptr ||
+            strtok_r(nullptr, ",", &save) != nullptr) return invalid("ERR,JOG4_FORMAT");
+
+        char *end = nullptr;
+        const float rate = strtof(rateField, &end);
+        if (end == rateField || *end != '\0' || !isfinite(rate) ||
+            rate < -JOG_MAX_STEPS_PER_SECOND || rate > JOG_MAX_STEPS_PER_SECOND) {
+            return invalid("ERR,JOG4_RATE");
+        }
+        end = nullptr;
+        const long duration = strtol(durationField, &end, 10);
+        if (end == durationField || *end != '\0' || duration < 1 || duration > 2000) {
+            return invalid("ERR,JOG4_DURATION");
+        }
+
+        ParsedCommand command;
+        command.type = CommandType::JOG_J4;
+        command.rate = rate;
+        command.durationMs = static_cast<uint32_t>(duration);
+        return command;
+    }
 
     if (startsWithIgnoreCase(line, "BENCH,")) {
         char *save = nullptr;
@@ -82,7 +115,7 @@ ParsedCommand CommandParser::parse(char *line, const float currentTarget[JOINT_C
         ParsedCommand command;
         command.type = CommandType::BENCH;
         command.channel = static_cast<int>(channel);
-        command.rate = rate;
+        command.rate = static_cast<float>(rate);
         command.durationMs = static_cast<uint32_t>(duration);
         return command;
     }

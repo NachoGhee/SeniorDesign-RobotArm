@@ -15,6 +15,8 @@ enum class CommandType : uint8_t {
     GCODE_ESTOP,
     SCAN_ENCODERS,
     BENCH,
+    JOG_J4,
+    ZERO_J4,
     ARM,
     DISARM,
     CONFIG_I2C,
@@ -30,7 +32,7 @@ struct ParsedCommand {
     uint32_t sequence = 0;
     bool hasSequence = false;
     int channel = -1;
-    long rate = 0;
+    float rate = 0;
     uint32_t durationMs = 0;
     bool enabled = false;
     float target[JOINT_COUNT] = {};

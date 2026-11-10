@@ -12,9 +12,10 @@
 constexpr uint8_t JOINT_COUNT = 6;
 constexpr uint8_t MOTOR_COUNT = 7;
 constexpr uint8_t BENCH_JOINT_2_MOTOR_MASK = (1U << 1) | (1U << 2);
+constexpr uint8_t J4_MOTOR_CHANNEL = 5;
 constexpr uint32_t SERIAL_BAUD = 115200;
 constexpr uint32_t COMMAND_TIMEOUT_MS = 50000;
-constexpr uint32_t SENSOR_PERIOD_US = 5000;
+constexpr uint32_t SENSOR_PERIOD_US = 10000;
 constexpr uint32_t TELEMETRY_PERIOD_MS = 100;
 constexpr uint32_t STEP_PULSE_US = 15;
 constexpr float MAX_STEP_RATE = 20000.0f;
@@ -287,8 +288,11 @@ void disableDrivers() {
 
 void enableDrivers() {
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+        const bool selectedForMotion = armState == ArmState::BENCH_MOTION
+            ? (benchMotorMask & (1U << i)) != 0
+            : (!BENCH_TEST_MODE || (benchMotorMask & (1U << i)) != 0);
         if (motorChannelConfigured(i) && validPin(motors[i].enablePin) &&
-            (!BENCH_TEST_MODE || (benchMotorMask & (1U << i)) != 0)) {
+            selectedForMotion) {
             digitalWrite(motors[i].enablePin, motors[i].enableActiveLevel);
         }
     }
@@ -615,6 +619,46 @@ void processCommand(char *line) {
             Serial.println("OK,BENCH_STARTED");
             break;
         }
+        case command_parser::CommandType::JOG_J4:
+            if (armState != ArmState::DISARMED && armState != ArmState::BENCH_MOTION) {
+                Serial.println("ERR,JOG4_STATE");
+                break;
+            }
+            if (!stepperTaskReady || !motorChannelConfigured(J4_MOTOR_CHANNEL) || !motorPinsReady()) {
+                Serial.println("ERR,JOG4_NOT_CONFIGURED");
+                break;
+            }
+            benchMotorMask = static_cast<uint8_t>(1U << J4_MOTOR_CHANNEL);
+            for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+                motors[i].stepsPerSecond = i == J4_MOTOR_CHANNEL
+                    ? static_cast<float>(command.rate) : 0;
+            }
+            armState = ArmState::BENCH_MOTION;
+            lastCommandMs = millis();
+            benchStopAtMs = lastCommandMs + command.durationMs;
+            enableDrivers();
+            Serial.println("OK,JOG4");
+            break;
+        case command_parser::CommandType::ZERO_J4:
+            if (armState != ArmState::DISARMED) {
+                Serial.println("ERR,ZERO_REQUIRES_DISARMED");
+                break;
+            }
+            if ((!encoderHardwareReady && !initializeEncoderHardware()) || !readMt6701(J4_INDEX)) {
+                Serial.println("ERR,J4_ENCODER");
+                break;
+            }
+            {
+                const float motorAngleDeg = encoders[J4_INDEX].rawAngle * (360.0f / 16384.0f);
+                j4PreviousMotorAngleDeg = motorAngleDeg;
+                encoders[J4_INDEX].angleDeg = J4_STARTUP_ANGLE_DEG;
+                j4BacklashRemainingMotorDeg = 0.0f;
+                j4LastMotorDirection = 0;
+                j4TrackerInitialized = true;
+                targetDeg[J4_INDEX] = J4_STARTUP_ANGLE_DEG;
+            }
+            Serial.println("OK,ZERO4,0.00");
+            break;
         case command_parser::CommandType::ARM:
             if (BENCH_TEST_MODE) Serial.println("ERR,BENCH_ONLY");
             else if (armState == ArmState::FAULT_ESTOP) Serial.println("ERR,ESTOP");
@@ -750,8 +794,10 @@ void updateMotorOutputs() {
         if (motor.stepHigh && static_cast<uint32_t>(now - motor.stepRiseUs) >= STEP_PULSE_US) {
             motor.setStepLow();
         }
-        if (!motorChannelConfigured(i) ||
-            (BENCH_TEST_MODE && (benchMotorMask & (1U << i)) == 0)) continue;
+        const bool excludedByMask = armState == ArmState::BENCH_MOTION
+            ? (benchMotorMask & (1U << i)) == 0
+            : (BENCH_TEST_MODE && (benchMotorMask & (1U << i)) == 0);
+        if (!motorChannelConfigured(i) || excludedByMask) continue;
         if (!targetActive() || faultMask != 0) continue;
         const float rate = motors[i].stepsPerSecond;
         if (fabsf(rate) < 1.0f || motor.stepHigh) continue;
@@ -849,7 +895,7 @@ void setup() {
 
 void loop() {
     readSerial();
-    if (BENCH_TEST_MODE && benchStopAtMs != 0 &&
+    if (armState == ArmState::BENCH_MOTION && benchStopAtMs != 0 &&
         static_cast<int32_t>(millis() - benchStopAtMs) >= 0) {
         disarm();
         benchStopAtMs = 0;

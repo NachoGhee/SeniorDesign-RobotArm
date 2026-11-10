@@ -16,6 +16,7 @@ from serial_link import SerialConnection
 SERIAL_PORT = os.environ.get("POSE_SERIAL_PORT", "COM10" if os.name == "nt" else "/dev/ttyACM0")
 BAUD_RATE = 115200
 SEND_PERIOD_S = 0.05
+J4_CALIBRATION_SEND_PERIOD_S = 0.10
 
 
 def main(argv=None):
@@ -71,6 +72,10 @@ def main(argv=None):
     last_send = 0.0
     last_telemetry_time = 0.0
     controller_ready = False
+    j4_calibration_mode = False
+    startup_calibration_complete = False
+    last_j4_jog_rate = 0
+    last_j4_jog_send = 0.0
     last_not_ready_message = False
     last_ik_error_time = 0.0
     clock = pygame.time.Clock()
@@ -87,23 +92,31 @@ def main(argv=None):
                     connection.send_command("X")
                     print("E-stop sent; controller must be power-cycled to clear it.")
                     running = False
-                elif action == "confirm_i2c":
-                    if not controller_ready:
-                        connection.send_command("CFG,I2C,1")
-                elif action == "confirm_calibration":
-                    if not controller_ready:
-                        connection.send_command("CFG,CAL,1")
-                elif action == "arm":
-                    if ik_ready:
-                        connection.send_command("G90")
-                        connection.send_command("M17")
-                    else:
-                        print("Arm blocked: configure the POE model and IK-Geo solver first.")
                 elif action == "disarm":
                     connection.send_command("DISARM")
+                    j4_calibration_mode = False
+                    last_j4_jog_rate = 0
                     target_pose = None
                     seed_angles_rad = None
                     controller_ready = False
+
+            if gamepad_update.j4_calibration_toggle:
+                if j4_calibration_mode:
+                    connection.send_command("DISARM")
+                    j4_calibration_mode = False
+                    last_j4_jog_rate = 0
+                    target_pose = None
+                    seed_angles_rad = None
+                    controller_ready = False
+                    print("J4 calibration mode stopped.")
+                else:
+                    connection.send_command("DISARM")
+                    j4_calibration_mode = True
+                    last_j4_jog_rate = 0
+                    target_pose = None
+                    seed_angles_rad = None
+                    controller_ready = False
+                    print("J4 calibration mode: align the witness marks, then press START or A.")
 
             now = time.monotonic()
             telemetry = connection.read_telemetry()
@@ -140,6 +153,53 @@ def main(argv=None):
                 controller_ready = False
                 target_pose = None
                 seed_angles_rad = None
+
+            if j4_calibration_mode:
+                jog_rate = gamepad_update.j4_jog_rate
+                if gamepad_update.j4_calibration_confirm and jog_rate == 0:
+                    connection.send_command("DISARM")
+                    connection.send_command("ZERO4")
+                    connection.send_command("CFG,I2C,1")
+                    connection.send_command("CFG,CAL,1")
+                    connection.send_command("ARM")
+                    j4_calibration_mode = False
+                    startup_calibration_complete = True
+                    last_j4_jog_rate = 0
+                    target_pose = None
+                    seed_angles_rad = None
+                    controller_ready = False
+                    print("J4 zero latched; arming closed-loop control.")
+                elif jog_rate != 0:
+                    if now - last_j4_jog_send >= J4_CALIBRATION_SEND_PERIOD_S:
+                        connection.send_command(f"JOG4,{int(jog_rate)},150")
+                        last_j4_jog_send = now
+                    last_j4_jog_rate = jog_rate
+                elif last_j4_jog_rate != 0:
+                    connection.send_command("JOG4,0,10")
+                    last_j4_jog_rate = 0
+
+                screen.fill((30, 30, 30))
+                screen.blit(font.render("J4 CALIBRATION", True, (255, 220, 90)), (20, 20))
+                screen.blit(font.render(f"Jog rate: {jog_rate:+d} steps/s", True, (255, 255, 255)), (20, 80))
+                screen.blit(font.render("Align marks, then press START or A", True, (190, 190, 190)), (20, 125))
+                pygame.display.flip()
+                continue
+
+            for action in gamepad_update.actions:
+                if action == "confirm_i2c":
+                    if not controller_ready:
+                        connection.send_command("CFG,I2C,1")
+                elif action == "confirm_calibration":
+                    if not controller_ready:
+                        connection.send_command("CFG,CAL,1")
+                elif action == "arm":
+                    if not startup_calibration_complete:
+                        print("Arm blocked: complete J4 startup calibration first.")
+                    elif ik_ready:
+                        connection.send_command("G90")
+                        connection.send_command("M17")
+                    else:
+                        print("Arm blocked: configure the POE model and IK-Geo solver first.")
 
             if target_pose is not None and seed_angles_rad is not None and controller_ready and ik_ready:
                 for coordinate, velocity in enumerate(gamepad_update.desired_velocity):
