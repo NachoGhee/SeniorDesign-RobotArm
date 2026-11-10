@@ -1,19 +1,21 @@
 from dataclasses import dataclass
+import os
 
 import pygame
 
 
 DEADZONE = 0.15
-CARTESIAN_AXIS_TO_XYZ = {0: 0, 1: 1, 4: 2}
-CARTESIAN_AXIS_LABELS = {0: "LS X", 1: "LS Y", 4: "RS Y"}
-CARTESIAN_AXIS_SIGN = {0: 1, 1: -1, 4: 1}
+CARTESIAN_RIGHT_Y_AXIS = int(os.environ.get("POSE_GAMEPAD_RIGHT_Y_AXIS", "4"))
+CARTESIAN_AXIS_TO_XYZ = {0: 0, 1: 1, CARTESIAN_RIGHT_Y_AXIS: 2}
+CARTESIAN_AXIS_LABELS = {0: "LS X", 1: "LS Y", CARTESIAN_RIGHT_Y_AXIS: "RS Y"}
+CARTESIAN_AXIS_SIGN = {0: 1, 1: -1, CARTESIAN_RIGHT_Y_AXIS: 1}
 CARTESIAN_SPEED_M_S = (0.10, 0.10, 0.10)
-ESTOP_BUTTON = 1
-START_INIT_BUTTON = 7
-J4_BACK_BUTTON = 6
-J4_A_BUTTON = 0
-J4_LEFT_BUMPER = 4
-J4_RIGHT_BUMPER = 5
+ESTOP_BUTTON = int(os.environ.get("POSE_GAMEPAD_ESTOP_BUTTON", "1"))
+START_INIT_BUTTON = int(os.environ.get("POSE_GAMEPAD_START_BUTTON", "11"))
+J4_BACK_BUTTON = int(os.environ.get("POSE_GAMEPAD_BACK_BUTTON", "10"))
+J4_A_BUTTON = int(os.environ.get("POSE_GAMEPAD_A_BUTTON", "0"))
+J4_LEFT_BUMPER = int(os.environ.get("POSE_GAMEPAD_LB_BUTTON", "6"))
+J4_RIGHT_BUMPER = int(os.environ.get("POSE_GAMEPAD_RB_BUTTON", "7"))
 J4_JOG_AXIS = 1
 J4_JOG_MAX_RATE = 3200
 J4_FINE_JOG_RATE = 250
@@ -59,7 +61,7 @@ class GamepadController:
             elif event.type == pygame.JOYBUTTONDOWN:
                 if event.button == ESTOP_BUTTON:
                     actions.append("estop")
-                    active_controls.append("B / button 1: E-stop")
+                    active_controls.append(f"Button {event.button}: E-stop")
                 elif event.button == J4_BACK_BUTTON:
                     j4_calibration_toggle = True
                     active_controls.append("BACK/SELECT: toggle J4 calibration")
