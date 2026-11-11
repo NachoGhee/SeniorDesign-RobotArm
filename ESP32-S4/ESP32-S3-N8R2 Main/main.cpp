@@ -12,7 +12,7 @@
 constexpr uint8_t JOINT_COUNT = 6;
 constexpr uint8_t MOTOR_COUNT = 7;
 constexpr uint8_t BENCH_JOINT_2_MOTOR_MASK = (1U << 1) | (1U << 2);
-constexpr uint8_t J4_MOTOR_CHANNEL = 5;
+constexpr uint8_t J4_MOTOR_CHANNEL = 4;
 constexpr uint32_t SERIAL_BAUD = 115200;
 constexpr uint32_t COMMAND_TIMEOUT_MS = 50000;
 constexpr uint32_t SENSOR_PERIOD_US = 10000;
@@ -145,14 +145,14 @@ StepperMotor motors[MOTOR_COUNT] = {
     {DM556_LJ2_STEP_PIN, DM556_LJ2_DIR_PIN, -1, 1, 1, HIGH, LOW, DM556_PULSES_PER_REV, 1, 130.302f},
     // 2: RJ2 (jointIndex = 1)
     {DM556_RJ2_STEP_PIN, DM556_RJ2_DIR_PIN, -1, 1, 1, HIGH, LOW, DM556_PULSES_PER_REV, 1, 130.302f},
-    // 3: J6 (jointIndex = 5)
-    {TMC2209_J6_STEP_PIN, TMC2209_J6_DIR_PIN, CNC_SHIELD_ENABLE_PIN, 5, 1, HIGH, LOW, 200.0f, 16.0f, 1.0f},
-    // 4: J3 (jointIndex = 2)
+    // 3: J3 (jointIndex = 2)
     {TMC2209_J3_STEP_PIN, TMC2209_J3_DIR_PIN, CNC_SHIELD_ENABLE_PIN, 2, 1, HIGH, LOW, 200.0f, 16.0f, 1.0f},
-    // 5: J4 (jointIndex = 3)
+    // 4: J4 (jointIndex = 3)
     {TMC2209_J4_STEP_PIN, TMC2209_J4_DIR_PIN, CNC_SHIELD_ENABLE_PIN, 3, 1, HIGH, LOW, 200.0f, 16.0f, J4_GEAR_RATIO},
-    // 6: J5 (jointIndex = 4)
-    {TMC2209_J5_STEP_PIN, TMC2209_J5_DIR_PIN, CNC_SHIELD_ENABLE_PIN, 4, 1, HIGH, LOW, 200.0f, 16.0f, 1.0f}
+    // 5: J5 (jointIndex = 4)
+    {TMC2209_J5_STEP_PIN, TMC2209_J5_DIR_PIN, CNC_SHIELD_ENABLE_PIN, 4, 1, HIGH, LOW, 200.0f, 16.0f, 1.0f},
+    // 6: J6 (jointIndex = 5)
+    {TMC2209_J6_STEP_PIN, TMC2209_J6_DIR_PIN, CNC_SHIELD_ENABLE_PIN, 5, 1, HIGH, LOW, 200.0f, 16.0f, 1.0f}
 };
 float targetDeg[JOINT_COUNT] = {0, 0, 0, 0, 0, 0};
 volatile uint8_t faultMask = 0;
@@ -487,11 +487,11 @@ void testAndDisplayEncoders() {
             if (i == J4_INDEX) updateJ4JointAngle();
             ++passedCount;
             Serial.printf("[OK] Joint %u: angle=%8.3f deg, mux channel=%u\n",
-                          i, encoders[i].angleDeg, MT6701_MUX_CHANNEL[i]);
+                          i + 1, encoders[i].angleDeg, MT6701_MUX_CHANNEL[i]);
         } else {
             ++failedCount;
             Serial.printf("[FAIL] Joint %u: MT6701 I2C read failed, mux channel=%u\n",
-                          i, MT6701_MUX_CHANNEL[i]);
+                          i + 1, MT6701_MUX_CHANNEL[i]);
         }
     }
 
