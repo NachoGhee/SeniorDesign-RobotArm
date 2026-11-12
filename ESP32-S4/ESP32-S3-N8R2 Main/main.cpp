@@ -4,7 +4,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <soc/gpio_struct.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include "CommandParser.h"
@@ -164,10 +163,6 @@ volatile bool stepperTaskReady = false;
 volatile uint8_t benchMotorMask = 0;
 volatile bool limitSwitchTriggered = false;
 uint32_t benchStopAtMs = 0;
-uint32_t emergencyDisableSetLow = 0;
-uint32_t emergencyDisableClearLow = 0;
-uint32_t emergencyDisableSetHigh = 0;
-uint32_t emergencyDisableClearHigh = 0;
 bool stopServiced = false;
 command_parser::CommandParser commandParser;
 
@@ -280,55 +275,16 @@ void disableDrivers() {
     benchMotorMask = 0;
     for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
         motors[i].stepsPerSecond = 0;
-        if (motorChannelConfigured(i) && validPin(motors[i].enablePin)) {
-            digitalWrite(motors[i].enablePin, !motors[i].enableActiveLevel);
-        }
-    }
-}
-
-void enableDrivers() {
-    for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
-        const bool selectedForMotion = armState == ArmState::BENCH_MOTION
-            ? (benchMotorMask & (1U << i)) != 0
-            : (!BENCH_TEST_MODE || (benchMotorMask & (1U << i)) != 0);
-        if (motorChannelConfigured(i) && validPin(motors[i].enablePin) &&
-            selectedForMotion) {
-            digitalWrite(motors[i].enablePin, motors[i].enableActiveLevel);
-        }
     }
 }
 
 void IRAM_ATTR emergencyStopISR() {
     armState = ArmState::FAULT_ESTOP;
-    GPIO.out_w1ts = emergencyDisableSetLow;
-    GPIO.out_w1tc = emergencyDisableClearLow;
-    GPIO.out1_w1ts.val = emergencyDisableSetHigh;
-    GPIO.out1_w1tc.val = emergencyDisableClearHigh;
 }
 
 void IRAM_ATTR limitSwitchISR() {
     limitSwitchTriggered = true;
     emergencyStopISR();
-}
-
-void prepareEmergencyDisableMasks() {
-    emergencyDisableSetLow = 0;
-    emergencyDisableClearLow = 0;
-    emergencyDisableSetHigh = 0;
-    emergencyDisableClearHigh = 0;
-    for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
-        if (!motorChannelConfigured(i) || !validPin(motors[i].enablePin)) continue;
-        const bool disableLevel = !motors[i].enableActiveLevel;
-        if (motors[i].enablePin < 32) {
-            const uint32_t bit = 1UL << motors[i].enablePin;
-            if (disableLevel) emergencyDisableSetLow |= bit;
-            else emergencyDisableClearLow |= bit;
-        } else {
-            const uint32_t bit = 1UL << (motors[i].enablePin - 32);
-            if (disableLevel) emergencyDisableSetHigh |= bit;
-            else emergencyDisableClearHigh |= bit;
-        }
-    }
 }
 
 bool selectMuxChannel(uint8_t channel) {
@@ -419,7 +375,6 @@ bool readEncoder(uint8_t index) {
     if (index == J4_INDEX) updateJ4JointAngle();
     return true;
 }
-
 /**
  * @brief Refreshes every configured encoder and latches sensor faults.
  * @note A failed read disables the drivers and exits active motion.
@@ -437,7 +392,6 @@ void readAllEncoders() {
         armState = ArmState::DISARMED;
     }
 }
-
 void stopAndLatch(const char *reason) {
     armState = ArmState::FAULT_ESTOP;
     benchStopAtMs = 0;
@@ -540,7 +494,6 @@ void acceptJointTarget(const float requested[JOINT_COUNT]) {
     memcpy(targetDeg, requested, sizeof(targetDeg));
     armState = ArmState::IN_MOTION;
     lastCommandMs = millis();
-    enableDrivers();
     Serial.println("ok");
 }
 
@@ -615,7 +568,6 @@ void processCommand(char *line) {
             armState = ArmState::BENCH_MOTION;
             lastCommandMs = millis();
             benchStopAtMs = lastCommandMs + command.durationMs;
-            enableDrivers();
             Serial.println("OK,BENCH_STARTED");
             break;
         }
@@ -636,7 +588,6 @@ void processCommand(char *line) {
             armState = ArmState::BENCH_MOTION;
             lastCommandMs = millis();
             benchStopAtMs = lastCommandMs + command.durationMs;
-            enableDrivers();
             Serial.println("OK,JOG4");
             break;
         case command_parser::CommandType::ZERO_J4:
@@ -668,7 +619,6 @@ void processCommand(char *line) {
             else {
                 armState = ArmState::ARMED;
                 lastCommandMs = millis();
-                enableDrivers();
                 Serial.println("OK,ARMED");
             }
             break;
@@ -864,10 +814,9 @@ void setup() {
         }
         if (validPin(motors[i].enablePin)) {
             pinMode(motors[i].enablePin, OUTPUT);
-            digitalWrite(motors[i].enablePin, !motors[i].enableActiveLevel);
+            digitalWrite(motors[i].enablePin, motors[i].enableActiveLevel);
         }
     }
-    prepareEmergencyDisableMasks();
     if (validPin(LIMIT_SWITCH_PIN)) {
         pinMode(LIMIT_SWITCH_PIN, INPUT_PULLUP);
         attachInterrupt(digitalPinToInterrupt(LIMIT_SWITCH_PIN), limitSwitchISR, FALLING);
