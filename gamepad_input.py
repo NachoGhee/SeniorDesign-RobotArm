@@ -11,6 +11,8 @@ CARTESIAN_AXIS_LABELS = {0: "LS X", 1: "LS Y", CARTESIAN_RIGHT_Y_AXIS: "RS Y"}
 CARTESIAN_AXIS_SIGN = {0: 1, 1: -1, CARTESIAN_RIGHT_Y_AXIS: 1}
 CARTESIAN_SPEED_M_S = (0.10, 0.10, 0.10)
 ESTOP_BUTTON = int(os.environ.get("POSE_GAMEPAD_ESTOP_BUTTON", "1"))
+RECORD_BUTTON = int(os.environ.get("POSE_GAMEPAD_RECORD_BUTTON", "2"))
+REPLAY_BUTTON = int(os.environ.get("POSE_GAMEPAD_REPLAY_BUTTON", "3"))
 START_INIT_BUTTON = int(os.environ.get("POSE_GAMEPAD_START_BUTTON", "11"))
 J4_BACK_BUTTON = int(os.environ.get("POSE_GAMEPAD_BACK_BUTTON", "10"))
 J4_A_BUTTON = int(os.environ.get("POSE_GAMEPAD_A_BUTTON", "0"))
@@ -62,6 +64,12 @@ class GamepadController:
                 if event.button == ESTOP_BUTTON:
                     actions.append("estop")
                     active_controls.append(f"Button {event.button}: E-stop")
+                elif event.button == RECORD_BUTTON:
+                    actions.append("toggle_record")
+                    active_controls.append(f"Button {event.button} (X): Record toggle")
+                elif event.button == REPLAY_BUTTON:
+                    actions.append("trigger_replay")
+                    active_controls.append(f"Button {event.button} (Y): Replay motion")
                 elif event.button == J4_BACK_BUTTON:
                     j4_calibration_toggle = True
                     active_controls.append("BACK/SELECT: toggle J4 calibration")
@@ -86,6 +94,12 @@ class GamepadController:
                 elif event.key == pygame.K_d:
                     actions.append("disarm")
                     active_controls.append("Key D: disarm")
+                elif event.key == pygame.K_r:
+                    actions.append("toggle_record")
+                    active_controls.append("Key R: Record toggle")
+                elif event.key == pygame.K_p:
+                    actions.append("trigger_replay")
+                    active_controls.append("Key P: Replay motion")
 
         velocity = [0.0, 0.0, 0.0]
         for axis, coordinate in CARTESIAN_AXIS_TO_XYZ.items():
