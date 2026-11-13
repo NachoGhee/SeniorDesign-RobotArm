@@ -83,6 +83,40 @@ ParsedCommand CommandParser::parse(char *line, const float currentTarget[JOINT_C
         return command;
     }
 
+    if (startsWithIgnoreCase(line, "BENCH_MULTI,")) {
+        const size_t lineLength = strlen(line);
+        if (line[lineLength - 1] == ',' || strstr(line, ",,") != nullptr) {
+            return invalid("ERR,BENCH_FORMAT");
+        }
+        char *save = nullptr;
+        strtok_r(line, ",", &save);
+        ParsedCommand command;
+        command.type = CommandType::BENCH_MULTI;
+        for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+            char *rateField = strtok_r(nullptr, ",", &save);
+            if (rateField == nullptr) return invalid("ERR,BENCH_FORMAT");
+            char *end = nullptr;
+            const float rate = strtof(rateField, &end);
+            if (end == rateField || *end != '\0' || !isfinite(rate) ||
+                rate < -JOG_MAX_STEPS_PER_SECOND || rate > JOG_MAX_STEPS_PER_SECOND) {
+                return invalid("ERR,BENCH_RATE");
+            }
+            command.motorRates[i] = rate;
+        }
+        char *durationField = strtok_r(nullptr, ",", &save);
+        if (durationField == nullptr || strtok_r(nullptr, ",", &save) != nullptr) {
+            return invalid("ERR,BENCH_FORMAT");
+        }
+        char *end = nullptr;
+        const long duration = strtol(durationField, &end, 10);
+        if (end == durationField || *end != '\0' || duration < 1 ||
+            duration > BENCH_MAX_DURATION_MS) {
+            return invalid("ERR,BENCH_DURATION");
+        }
+        command.durationMs = static_cast<uint32_t>(duration);
+        return command;
+    }
+
     if (startsWithIgnoreCase(line, "BENCH,")) {
         char *save = nullptr;
         strtok_r(line, ",", &save);

@@ -99,6 +99,9 @@ def main(argv=None):
     last_controller_button_time = 0.0
     last_not_ready_message = False
     last_ik_error_time = 0.0
+    bench_test_mode = False
+    last_bench_send = 0.0
+    last_bench_rates = (0, 0, 0, 0, 0, 0, 0)
     clock = pygame.time.Clock()
     running = True
 
@@ -114,6 +117,12 @@ def main(argv=None):
             j4_calibration_mode = False
             last_j4_jog_rate = 0
 
+    def send_bench_rates(rates):
+        if not rates:
+            rates = (0, 0, 0, 0, 0, 0, 0)
+        payload = ",".join(str(int(round(rate))) for rate in rates)
+        connection.send_command(f"BENCH_MULTI,{payload},200")
+
     try:
         while running:
             dt = min(clock.tick(50) / 1000.0, 0.1)
@@ -127,6 +136,15 @@ def main(argv=None):
                     reset_motion_state(clear_calibration=True)
                     print("E-stop sent; controller must be power-cycled to clear it.")
                     running = False
+                elif action == "toggle_bench_mode":
+                    bench_test_mode = not bench_test_mode
+                    reset_motion_state(clear_calibration=True)
+                    connection.send_command("BENCH_MULTI,0,0,0,0,0,0,0,10")
+                    connection.send_command("DISARM")
+                    if bench_test_mode:
+                        print("Bench test debug mode enabled: encoders ignored; open-loop bench motion active.")
+                    else:
+                        print("Bench test debug mode disabled: returning to normal controller mode.")
                 elif action == "disarm":
                     connection.send_command("DISARM")
                     reset_motion_state(clear_calibration=True)
@@ -213,6 +231,8 @@ def main(argv=None):
 
             if gamepad_update.j4_calibration_toggle:
                 connection.send_command("DISARM")
+                bench_test_mode = False
+                last_bench_rates = (0, 0, 0, 0, 0, 0, 0)
                 if j4_calibration_mode:
                     reset_motion_state(clear_calibration=True)
                     print("J4 calibration mode stopped.")
@@ -254,30 +274,31 @@ def main(argv=None):
                     motor_step_deltas = [curr - prev for curr, prev in zip(steps, prev_steps)]
                 prev_steps = list(steps)
                 latest_telemetry = telemetry
-                if telemetry["faults"]:
-                    reset_motion_state()
-                elif telemetry["ready"] and len(telemetry["angles"]) == 6 and np.all(
-                    np.isfinite(telemetry["angles"])
-                ):
-                    controller_ready = True
-                    last_not_ready_message = False
-                    if target_pose is None and ik_ready:
-                        try:
-                            seed_angles_rad = ikgeo_model.encoder_degrees_to_model_radians(
-                                np.asarray(telemetry["angles"], dtype=float)
-                            )
-                            target_pose = ikgeo_model.forward_camera_pose(seed_angles_rad)
-                            joint_targets_deg = np.asarray(
-                                ikgeo_model.model_radians_to_encoder_degrees(seed_angles_rad), dtype=float
-                            ).copy()
-                            print("Cartesian target initialized from measured camera pose.")
-                        except (ValueError, ikgeo_model.RobotModelNotConfigured) as error:
-                            ik_ready = False
-                            print(f"Cartesian IK disabled: {error}")
-                else:
-                    reset_motion_state()
+                if not bench_test_mode:
+                    if telemetry["faults"]:
+                        reset_motion_state()
+                    elif telemetry["ready"] and len(telemetry["angles"]) == 6 and np.all(
+                        np.isfinite(telemetry["angles"])
+                    ):
+                        controller_ready = True
+                        last_not_ready_message = False
+                        if target_pose is None and ik_ready:
+                            try:
+                                seed_angles_rad = ikgeo_model.encoder_degrees_to_model_radians(
+                                    np.asarray(telemetry["angles"], dtype=float)
+                                )
+                                target_pose = ikgeo_model.forward_camera_pose(seed_angles_rad)
+                                joint_targets_deg = np.asarray(
+                                    ikgeo_model.model_radians_to_encoder_degrees(seed_angles_rad), dtype=float
+                                ).copy()
+                                print("Cartesian target initialized from measured camera pose.")
+                            except (ValueError, ikgeo_model.RobotModelNotConfigured) as error:
+                                ik_ready = False
+                                print(f"Cartesian IK disabled: {error}")
+                    else:
+                        reset_motion_state()
 
-            if now - last_telemetry_time > 0.5:
+            if now - last_telemetry_time > 0.5 and not bench_test_mode:
                 reset_motion_state()
 
             active_trajectory = recorded_slots[selected_slot]
@@ -336,7 +357,26 @@ def main(argv=None):
                             connection.send_command(format_joint_gcode(joint_targets_deg))
                             last_send = now
 
-            if j4_calibration_mode:
+            if bench_test_mode:
+                bench_rates = tuple(gamepad_update.bench_motor_rates)
+                if bench_rates != last_bench_rates and any(rate != 0 for rate in bench_rates):
+                    payload = ",".join(str(int(round(rate))) for rate in bench_rates)
+                    connection.send_command(f"BENCH_MULTI,{payload},200")
+                    last_bench_send = now
+                elif any(rate != 0 for rate in bench_rates) and (
+                    now - last_bench_send >= 0.08 or last_bench_send == 0.0
+                ):
+                    payload = ",".join(str(int(round(rate))) for rate in bench_rates)
+                    connection.send_command(f"BENCH_MULTI,{payload},200")
+                    last_bench_send = now
+                elif not any(rate != 0 for rate in bench_rates) and any(
+                    rate != 0 for rate in last_bench_rates
+                ):
+                    connection.send_command("BENCH_MULTI,0,0,0,0,0,0,0,10")
+                    last_bench_send = 0.0
+                last_bench_rates = bench_rates
+
+            elif j4_calibration_mode:
                 jog_rate = gamepad_update.j4_jog_rate
                 if gamepad_update.j4_calibration_confirm and jog_rate == 0:
                     try:
@@ -415,7 +455,10 @@ def main(argv=None):
                 last_hud_draw = now
                 screen.fill((24, 26, 30))
 
-                if j4_calibration_mode:
+                if bench_test_mode:
+                    header = "MODE: BENCH TEST DEBUG (ENCODERS IGNORED | OPEN-LOOP)"
+                    header_color = (255, 180, 70)
+                elif j4_calibration_mode:
                     header = f"MODE: J4 CALIBRATION | JOG: {gamepad_update.j4_jog_rate:+d} steps/s"
                     header_color = (255, 215, 70)
                 elif replay_state != "IDLE":
@@ -474,11 +517,19 @@ def main(argv=None):
                     row = f"{label}: {measured_text} -> {target_text} ({err_text}) deg"
                     screen.blit(font.render(row, True, joint_color), (390, 98 + index * 25))
 
-                input_text = last_controller_input
+                input_text = (
+                    " | ".join(gamepad_update.bench_controls)
+                    if bench_test_mode and gamepad_update.bench_controls
+                    else last_controller_input
+                )
                 screen.blit(font.render(f"INPUT IN USE: {input_text}", True, (255, 215, 120)), (16, 265))
                 screen.blit(font.render(f"RECORD: {'ON' if recording_active else 'OFF'} | REPLAY: {replay_state}", True, (255, 215, 120)), (16, 286))
-                screen.blit(font.render("Cartesian: LS X/Y + RS Y -> XYZ", True, (190, 195, 205)), (16, 307))
-                screen.blit(font.render("J4: LS Y coarse | D-pad / LB / RB fine", True, (190, 195, 205)), (16, 328))
+                if bench_test_mode:
+                    screen.blit(font.render("BENCH: LSX=J1 | LSY=J2 | RSY=J3 | RSX=J4", True, (190, 195, 205)), (16, 307))
+                    screen.blit(font.render("BENCH: LB/RB=J5 | LT/RT=J6 | 2xSTART=exit", True, (190, 195, 205)), (16, 328))
+                else:
+                    screen.blit(font.render("Cartesian: LS X/Y + RS Y -> XYZ", True, (190, 195, 205)), (16, 307))
+                    screen.blit(font.render("J4: LS Y coarse | D-pad / LB / RB fine", True, (190, 195, 205)), (16, 328))
                 screen.blit(font.render(f"Slot {selected_slot + 1}: {'LOCKED' if slot_confirmed else 'READY'}", True, (255, 215, 120)), (390, 286))
                 screen.blit(font.render("L/R: slots | A: lock/unlock | START: zero", True, (190, 195, 205)), (390, 307))
                 screen.blit(font.render("X/R: record | Y/P: replay | B: E-stop", True, (190, 195, 205)), (390, 328))

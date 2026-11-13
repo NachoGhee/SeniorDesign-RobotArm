@@ -391,8 +391,10 @@ void readAllEncoders() {
         if (!readEncoder(i)) faultMask |= 1U << i;
     }
     if (faultMask != 0) {
-        if (armState != ArmState::FAULT_SYSTEM) armState = ArmState::FAULT_ENCODER;
-        disableDrivers();
+        if (armState != ArmState::FAULT_SYSTEM && armState != ArmState::BENCH_MOTION) {
+            armState = ArmState::FAULT_ENCODER;
+            disableDrivers();
+        }
     } else if (armState == ArmState::FAULT_ENCODER) {
         armState = ArmState::DISARMED;
     }
@@ -576,6 +578,43 @@ void processCommand(char *line) {
             Serial.println("OK,BENCH_STARTED");
             break;
         }
+        case command_parser::CommandType::BENCH_MULTI: {
+            if (armState == ArmState::FAULT_ESTOP) {
+                Serial.println("ERR,ESTOP");
+                break;
+            }
+            if (armState == ArmState::FAULT_SYSTEM) {
+                Serial.println("ERR,SYSTEM_FAULT");
+                break;
+            }
+            if (!stepperTaskReady || !motorPinsReady()) {
+                Serial.println("ERR,BENCH_NOT_CONFIGURED");
+                break;
+            }
+            uint8_t activeMask = 0;
+            for (uint8_t i = 0; i < MOTOR_COUNT; ++i) {
+                if (motorChannelConfigured(i) && fabsf(command.motorRates[i]) >= 1.0f) {
+                    activeMask |= static_cast<uint8_t>(1U << i);
+                    motors[i].stepsPerSecond = command.motorRates[i];
+                } else {
+                    motors[i].stepsPerSecond = 0.0f;
+                }
+            }
+            if (activeMask == 0) {
+                benchMotorMask = 0;
+                disableDrivers();
+                disarm();
+                benchStopAtMs = 0;
+                Serial.println("OK,BENCH_STOPPED");
+                break;
+            }
+            benchMotorMask = activeMask;
+            armState = ArmState::BENCH_MOTION;
+            lastCommandMs = millis();
+            benchStopAtMs = lastCommandMs + command.durationMs;
+            Serial.println("OK,BENCH_MULTI");
+            break;
+        }
         case command_parser::CommandType::JOG_J4:
             if (armState != ArmState::DISARMED && armState != ArmState::BENCH_MOTION) {
                 Serial.println("ERR,JOG4_STATE");
@@ -754,7 +793,7 @@ void updateMotorOutputs() {
             ? (benchMotorMask & (1U << i)) == 0
             : (BENCH_TEST_MODE && (benchMotorMask & (1U << i)) == 0);
         if (!motorChannelConfigured(i) || excludedByMask) continue;
-        if (!targetActive() || faultMask != 0) continue;
+        if (!targetActive() || (faultMask != 0 && armState != ArmState::BENCH_MOTION)) continue;
         const float rate = motors[i].stepsPerSecond;
         if (fabsf(rate) < 1.0f || motor.stepHigh) continue;
         const int8_t direction = rate > 0 ? 1 : -1;

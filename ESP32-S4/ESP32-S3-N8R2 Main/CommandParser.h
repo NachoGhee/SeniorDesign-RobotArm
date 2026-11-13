@@ -15,6 +15,7 @@ enum class CommandType : uint8_t {
     GCODE_ESTOP,
     SCAN_ENCODERS,
     BENCH,
+    BENCH_MULTI,
     JOG_J4,
     ZERO_J4,
     ARM,
@@ -36,6 +37,7 @@ struct ParsedCommand {
     uint32_t durationMs = 0;
     bool enabled = false;
     float target[JOINT_COUNT] = {};
+    float motorRates[MOTOR_COUNT] = {};
 };
 
 class CommandParser {
