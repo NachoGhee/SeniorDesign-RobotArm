@@ -328,8 +328,13 @@ bool readMt6701(uint8_t index) {
     encoders[index].valid = true;
     const float rawDegrees = encoders[index].rawAngle * (360.0f / 16384.0f);
     float corrected = (rawDegrees - ENCODER_ZERO_DEG[index]) * ENCODER_DIRECTION_SIGN[index];
-    while (corrected < 0) corrected += 360.0f;
-    while (corrected >= 360.0f) corrected -= 360.0f;
+    if (JOINT_MIN_DEG[index] < 0.0f) {
+        while (corrected > 180.0f) corrected -= 360.0f;
+        while (corrected < -180.0f) corrected += 360.0f;
+    } else {
+        while (corrected < 0.0f) corrected += 360.0f;
+        while (corrected >= 360.0f) corrected -= 360.0f;
+    }
     if (index != J4_INDEX) encoders[index].angleDeg = corrected;
     return true;
 }
