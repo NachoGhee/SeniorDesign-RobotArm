@@ -60,7 +60,7 @@ def main(argv=None):
         connection.close()
         return 1
 
-    screen = pygame.display.set_mode((840, 520))
+    screen = pygame.display.set_mode((1200, 700))
     pygame.display.set_caption("POSE Arm Kinematics & Telemetry HUD")
     font = pygame.font.SysFont("consolas", 15)
 

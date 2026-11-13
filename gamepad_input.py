@@ -6,6 +6,7 @@ import pygame
 
 
 DEADZONE = 0.15
+DOMINANT_AXIS_RATIO = 1.5
 CARTESIAN_RIGHT_Y_AXIS = int(os.environ.get("POSE_GAMEPAD_RIGHT_Y_AXIS", "4"))
 RIGHT_X_AXIS = int(os.environ.get("POSE_GAMEPAD_RIGHT_X_AXIS", "3"))
 RIGHT_Y_AXIS = CARTESIAN_RIGHT_Y_AXIS
@@ -57,6 +58,14 @@ def apply_deadzone(value):
     return (abs(value) - DEADZONE) / (1.0 - DEADZONE) * (1 if value > 0 else -1)
 
 
+def filter_dominant_axis(x_value, y_value):
+    if abs(y_value) > abs(x_value) * DOMINANT_AXIS_RATIO:
+        return 0.0, y_value
+    if abs(x_value) > abs(y_value) * DOMINANT_AXIS_RATIO:
+        return x_value, 0.0
+    return x_value, y_value
+
+
 class GamepadController:
     def __init__(self):
         pygame.init()
@@ -68,16 +77,70 @@ class GamepadController:
         self.joystick.init()
         self.prev_hat_x = 0
         self.last_start_press_time = 0.0
-        if self.joystick.get_numaxes() <= 4:
-            self.right_x_axis = int(os.environ.get("POSE_GAMEPAD_RIGHT_X_AXIS", "2"))
+        self.num_axes = self.joystick.get_numaxes()
+        self.num_buttons = self.joystick.get_numbuttons()
+        mode = os.environ.get("POSE_GAMEPAD_MODE", "").strip().lower()
+        mode = mode.replace("-", "").replace("_", "").replace(" ", "")
+        force_dinput = mode in {"dinput", "directinput", "8bitdo"}
+        self.dinput_mapping = self.num_buttons > 12 or force_dinput
+
+        right_x_override = os.environ.get("POSE_GAMEPAD_RIGHT_X_AXIS")
+        right_y_override = os.environ.get("POSE_GAMEPAD_RIGHT_Y_AXIS")
+        lt_axis_override = os.environ.get("POSE_GAMEPAD_LT_AXIS")
+        rt_axis_override = os.environ.get("POSE_GAMEPAD_RT_AXIS")
+        if self.dinput_mapping:
+            self.right_x_axis = (
+                int(right_x_override) if right_x_override is not None else RIGHT_X_AXIS
+            )
+            self.right_y_axis = (
+                int(right_y_override) if right_y_override is not None else RIGHT_Y_AXIS
+            )
+            self.lt_axis = int(lt_axis_override) if lt_axis_override is not None else -1
+            self.rt_axis = int(rt_axis_override) if rt_axis_override is not None else -1
+            self.lt_button = LT_BUTTON
+            self.rt_button = RT_BUTTON
         else:
-            self.right_x_axis = RIGHT_X_AXIS
-        self.right_y_axis = RIGHT_Y_AXIS
-        self.lt_axis = LT_AXIS
-        self.rt_axis = RT_AXIS
+            self.right_x_axis = int(right_x_override) if right_x_override is not None else 2
+            self.right_y_axis = int(right_y_override) if right_y_override is not None else 3
+            self.lt_axis = int(lt_axis_override) if lt_axis_override is not None else 4
+            self.rt_axis = int(rt_axis_override) if rt_axis_override is not None else 5
+            self.lt_button = -1
+            self.rt_button = -1
+
+        self.cartesian_axis_to_xyz = {0: 0, 1: 1, self.right_y_axis: 2}
+        self.cartesian_axis_labels = {0: "LS X", 1: "LS Y", self.right_y_axis: "RS Y"}
+        self.cartesian_axis_sign = {0: 1, 1: -1, self.right_y_axis: 1}
         pygame.event.pump()
-        self.lt_rest = self.joystick.get_axis(LT_AXIS) if self.joystick.get_numaxes() > LT_AXIS else 0.0
-        self.rt_rest = self.joystick.get_axis(RT_AXIS) if self.joystick.get_numaxes() > RT_AXIS else 0.0
+        self.lt_rest = (
+            self.joystick.get_axis(self.lt_axis)
+            if 0 <= self.lt_axis < self.num_axes
+            else 0.0
+        )
+        self.rt_rest = (
+            self.joystick.get_axis(self.rt_axis)
+            if 0 <= self.rt_axis < self.num_axes
+            else 0.0
+        )
+        mapping = "D-Input" if self.dinput_mapping else "XInput/SDL"
+        print(
+            f"Gamepad: {self.joystick.get_name()} ({mapping}, "
+            f"{self.num_axes} axes, {self.num_buttons} buttons) | "
+            f"J1=Axis 0 (LS X), J2=Axis 1 (LS Y), "
+            f"J3=Axis {self.right_y_axis} (RS_Y), "
+            f"J4=Axis {self.right_x_axis} (RS_X), "
+            f"J5=LB Button {J4_LEFT_BUMPER}/RB Button {J4_RIGHT_BUMPER}, "
+            f"J6=LT {self._mapping_label(self.lt_axis, self.lt_button)}/"
+            f"RT {self._mapping_label(self.rt_axis, self.rt_button)}"
+        )
+
+    @staticmethod
+    def _mapping_label(axis_index, button_index):
+        mappings = []
+        if axis_index >= 0:
+            mappings.append(f"Axis {axis_index}")
+        if button_index >= 0:
+            mappings.append(f"Button {button_index}")
+        return " + ".join(mappings) if mappings else "disabled"
 
     def _read_trigger(self, axis_index, button_index, rest_value):
         if (
@@ -173,22 +236,24 @@ class GamepadController:
                     active_controls.append("Key ENTER: confirm/deselect slot")
 
         velocity = [0.0, 0.0, 0.0]
-        for axis, coordinate in CARTESIAN_AXIS_TO_XYZ.items():
+        for axis, coordinate in self.cartesian_axis_to_xyz.items():
             if axis >= self.joystick.get_numaxes():
                 continue
             value = apply_deadzone(self.joystick.get_axis(axis))
             velocity[coordinate] = (
-                value * CARTESIAN_AXIS_SIGN[axis] * CARTESIAN_SPEED_M_S[coordinate]
+                value * self.cartesian_axis_sign[axis] * CARTESIAN_SPEED_M_S[coordinate]
             )
             if value != 0:
                 active_controls.append(
-                    f"{CARTESIAN_AXIS_LABELS[axis]} {velocity[coordinate]:+.2f} m/s"
+                    f"{self.cartesian_axis_labels[axis]} {velocity[coordinate]:+.2f} m/s"
                 )
 
         ls_x = apply_deadzone(self.joystick.get_axis(0)) if self.joystick.get_numaxes() > 0 else 0.0
         ls_y = apply_deadzone(self.joystick.get_axis(1)) if self.joystick.get_numaxes() > 1 else 0.0
+        ls_x, ls_y = filter_dominant_axis(ls_x, ls_y)
         rs_y = apply_deadzone(self.joystick.get_axis(self.right_y_axis)) if self.joystick.get_numaxes() > self.right_y_axis else 0.0
         rs_x = apply_deadzone(self.joystick.get_axis(self.right_x_axis)) if self.joystick.get_numaxes() > self.right_x_axis else 0.0
+        rs_x, rs_y = filter_dominant_axis(rs_x, rs_y)
         bench_motor_rates[0] = int(round(ls_x * BENCH_J1_MAX_RATE))
         bench_motor_rates[1] = int(round(-ls_y * BENCH_J2_MAX_RATE))
         bench_motor_rates[2] = int(round(-ls_y * BENCH_J2_MAX_RATE))
@@ -206,8 +271,8 @@ class GamepadController:
                 bench_motor_rates[5] = -BENCH_J5_RATE
                 bench_controls.append("LB -> J5 -")
 
-        lt_signal = self._read_trigger(self.lt_axis, LT_BUTTON, self.lt_rest)
-        rt_signal = self._read_trigger(self.rt_axis, RT_BUTTON, self.rt_rest)
+        lt_signal = self._read_trigger(self.lt_axis, self.lt_button, self.lt_rest)
+        rt_signal = self._read_trigger(self.rt_axis, self.rt_button, self.rt_rest)
         bench_motor_rates[6] = int(round((rt_signal - lt_signal) * BENCH_J6_MAX_RATE))
         if bench_motor_rates[6] != 0:
             bench_controls.append("LT/RT -> J6")

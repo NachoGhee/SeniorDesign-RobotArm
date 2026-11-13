@@ -21,11 +21,11 @@ constexpr float MAX_STEP_RATE = 20000.0f;
 constexpr uint32_t STEPPER_TASK_STACK_BYTES = 4096;
 constexpr UBaseType_t STEPPER_TASK_PRIORITY = 3;
 constexpr BaseType_t STEPPER_TASK_CORE = 0;
-constexpr bool BENCH_TEST_MODE = true;
+constexpr bool BENCH_TEST_MODE = false;
 // Bit N enables motor channel N for bench commands; only enabled channels need pins.
 constexpr uint8_t BENCH_MOTOR_MASK = 0x7F;
 // Bit N enables encoder channel N; set to zero when testing motors without encoders.
-constexpr uint8_t BENCH_ENCODER_MASK = 0x00;
+constexpr uint8_t BENCH_ENCODER_MASK = 0x3F;
 constexpr uint8_t J4_INDEX = 3;
 constexpr float J4_GEAR_RATIO = 100.0f;
 constexpr float J4_BACKLASH_ARC_MIN = 22.0f;
