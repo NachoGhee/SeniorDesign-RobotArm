@@ -20,6 +20,7 @@ J4_CALIBRATION_SEND_PERIOD_S = 0.10
 HUD_REFRESH_PERIOD_S = 0.10
 REPLAY_START_TOLERANCE_DEG = 2.0
 REPLAY_HOMING_TIMEOUT_S = 15.0
+NUM_RECORD_SLOTS = 5
 MOTOR_LABELS = ("M1:J1", "M2:LJ2", "M3:RJ2", "M4:J3", "M5:J4", "M6:J5", "M7:J6")
 JOINT_LABELS = ("J1(X)", "J2(Y)", "J3(Z)", "J4(A)", "J5(B)", "J6(C)")
 
@@ -69,7 +70,7 @@ def main(argv=None):
         print("Cartesian IK disabled until ikgeo_model.py is configured:")
         for error in model_errors:
             print(f"  - {error}")
-    print("Keys: S=confirm I2C, C=confirm calibration, A=arm, D=disarm, R=record, P=replay; controller button 1=E-stop.")
+    print("Keys: S=confirm I2C, C=confirm calibration, A=arm, D=disarm, R=record, P=replay; START zeroes J4, L/R select slots, A locks/unlocks selected slot.")
 
     target_pose = None
     seed_angles_rad = None
@@ -85,7 +86,9 @@ def main(argv=None):
     joint_targets_deg = [0.0] * 6
     recording_active = False
     record_start_time = 0.0
-    recorded_trajectory = []
+    recorded_slots = [[] for _ in range(NUM_RECORD_SLOTS)]
+    selected_slot = 0
+    slot_confirmed = False
     replay_state = "IDLE"
     replay_start_time = 0.0
     replay_frame_index = 0
@@ -127,17 +130,45 @@ def main(argv=None):
                 elif action == "disarm":
                     connection.send_command("DISARM")
                     reset_motion_state(clear_calibration=True)
+                elif action == "slot_prev":
+                    if recording_active or replay_state != "IDLE":
+                        print("Slot change blocked while motion is active.")
+                    elif slot_confirmed:
+                        print("Slot is locked; press A to deselect before changing slots.")
+                    else:
+                        selected_slot = (selected_slot - 1) % NUM_RECORD_SLOTS
+                        print(f"Selected slot {selected_slot + 1}.")
+                elif action == "slot_next":
+                    if recording_active or replay_state != "IDLE":
+                        print("Slot change blocked while motion is active.")
+                    elif slot_confirmed:
+                        print("Slot is locked; press A to deselect before changing slots.")
+                    else:
+                        selected_slot = (selected_slot + 1) % NUM_RECORD_SLOTS
+                        print(f"Selected slot {selected_slot + 1}.")
+                elif action == "slot_confirm_toggle":
+                    if j4_calibration_mode:
+                        print("Slot selection is unavailable while J4 calibration mode is active.")
+                    elif recording_active or replay_state != "IDLE":
+                        print("Slot lock is blocked while motion is active.")
+                    else:
+                        slot_confirmed = not slot_confirmed
+                        state_text = "confirmed" if slot_confirmed else "deselected"
+                        print(f"Slot {selected_slot + 1} {state_text}.")
                 elif action == "toggle_record":
+                    active_trajectory = recorded_slots[selected_slot]
                     if j4_calibration_mode:
                         print("Recording disabled while J4 calibration mode is active.")
+                    elif not slot_confirmed:
+                        print("Press A to confirm the selected slot first.")
                     elif not controller_ready or not ik_ready or target_pose is None or seed_angles_rad is None:
                         print("Recording requires a ready controller and valid Cartesian target.")
                     elif recording_active:
                         recording_active = False
-                        print(f"Recording stopped after {len(recorded_trajectory)} frames.")
+                        print(f"Recording stopped on slot {selected_slot + 1} after {len(active_trajectory)} frames.")
                     else:
                         replay_state = "IDLE"
-                        recorded_trajectory = []
+                        active_trajectory.clear()
                         record_start_time = now
                         recording_active = True
                         seed_copy = np.array(seed_angles_rad, dtype=float, copy=True)
@@ -145,23 +176,26 @@ def main(argv=None):
                         initial_angles = np.asarray(
                             ikgeo_model.model_radians_to_encoder_degrees(seed_copy), dtype=float
                         ).copy()
-                        recorded_trajectory.append({
+                        active_trajectory.append({
                             "t": 0.0,
                             "angles_deg": initial_angles,
                             "pose": pose_copy,
                             "seed_rad": seed_copy,
                         })
                         joint_targets_deg = initial_angles.copy()
-                        print("Recording started.")
+                        print(f"Recording started on slot {selected_slot + 1}.")
                 elif action == "trigger_replay":
+                    active_trajectory = recorded_slots[selected_slot]
                     if replay_state in {"HOMING", "PLAYING"}:
                         replay_state = "IDLE"
                         recording_active = False
                         target_pose = None
                         seed_angles_rad = None
                         print("Replay cancelled; re-locking onto current measured pose.")
-                    elif not recorded_trajectory:
-                        print("Replay blocked: no recorded trajectory available.")
+                    elif not slot_confirmed:
+                        print("Press A to confirm the selected slot first.")
+                    elif not active_trajectory:
+                        print("Replay blocked: selected slot is empty.")
                     elif not controller_ready or not ik_ready:
                         print("Replay blocked: controller telemetry is not ready.")
                     else:
@@ -169,13 +203,13 @@ def main(argv=None):
                         replay_state = "HOMING"
                         replay_start_time = now
                         replay_frame_index = 0
-                        start_frame = recorded_trajectory[0]
+                        start_frame = active_trajectory[0]
                         target_pose = np.array(start_frame["pose"], dtype=float, copy=True)
                         seed_angles_rad = np.array(start_frame["seed_rad"], dtype=float, copy=True)
                         joint_targets_deg = np.asarray(start_frame["angles_deg"], dtype=float).copy()
                         last_send = now
                         connection.send_command(format_joint_gcode(joint_targets_deg))
-                        print("Replay started: homing to the recorded start pose.")
+                        print(f"Replay started on slot {selected_slot + 1}: homing to the recorded start pose.")
 
             if gamepad_update.j4_calibration_toggle:
                 connection.send_command("DISARM")
@@ -186,7 +220,7 @@ def main(argv=None):
                     reset_motion_state(clear_calibration=False)
                     j4_calibration_mode = True
                     last_j4_jog_rate = 0
-                    print("J4 calibration mode: align the witness marks, then press START or A.")
+                    print("J4 calibration mode: align the witness marks, then press START.")
 
             now = time.monotonic()
             button_inputs = [
@@ -246,15 +280,16 @@ def main(argv=None):
             if now - last_telemetry_time > 0.5:
                 reset_motion_state()
 
+            active_trajectory = recorded_slots[selected_slot]
             if replay_state == "HOMING" and controller_ready and ik_ready:
-                if not recorded_trajectory:
+                if not active_trajectory:
                     replay_state = "IDLE"
                 else:
                     start_error = (
                         np.max(
                             np.abs(
                                 np.asarray(latest_telemetry["angles"], dtype=float)
-                                - np.asarray(recorded_trajectory[0]["angles_deg"], dtype=float)
+                                - np.asarray(active_trajectory[0]["angles_deg"], dtype=float)
                             )
                         )
                         if latest_telemetry is not None
@@ -265,20 +300,20 @@ def main(argv=None):
                         replay_state = "PLAYING"
                         replay_start_time = now
                         replay_frame_index = 0
-                        print("Replay homing complete; trajectory playback started.")
+                        print(f"Replay homing complete on slot {selected_slot + 1}; trajectory playback started.")
                     else:
                         if now - last_send >= SEND_PERIOD_S:
                             connection.send_command(
-                                format_joint_gcode(np.asarray(recorded_trajectory[0]["angles_deg"], dtype=float))
+                                format_joint_gcode(np.asarray(active_trajectory[0]["angles_deg"], dtype=float))
                             )
                             last_send = now
             elif replay_state == "PLAYING" and controller_ready and ik_ready:
-                if not recorded_trajectory:
+                if not active_trajectory:
                     replay_state = "IDLE"
                 else:
                     elapsed = now - replay_start_time
-                    if elapsed >= recorded_trajectory[-1]["t"]:
-                        frame = recorded_trajectory[-1]
+                    if elapsed >= active_trajectory[-1]["t"]:
+                        frame = active_trajectory[-1]
                         target_pose = np.array(frame["pose"], dtype=float, copy=True)
                         seed_angles_rad = np.array(frame["seed_rad"], dtype=float, copy=True)
                         joint_targets_deg = np.asarray(frame["angles_deg"], dtype=float).copy()
@@ -286,14 +321,14 @@ def main(argv=None):
                         last_send = now
                         replay_state = "IDLE"
                         recording_active = False
-                        print("Replay complete.")
+                        print(f"Replay complete on slot {selected_slot + 1}.")
                     else:
                         while (
-                            replay_frame_index + 1 < len(recorded_trajectory)
-                            and elapsed >= recorded_trajectory[replay_frame_index + 1]["t"]
+                            replay_frame_index + 1 < len(active_trajectory)
+                            and elapsed >= active_trajectory[replay_frame_index + 1]["t"]
                         ):
                             replay_frame_index += 1
-                        frame = recorded_trajectory[replay_frame_index]
+                        frame = active_trajectory[replay_frame_index]
                         target_pose = np.array(frame["pose"], dtype=float, copy=True)
                         seed_angles_rad = np.array(frame["seed_rad"], dtype=float, copy=True)
                         joint_targets_deg = np.asarray(frame["angles_deg"], dtype=float).copy()
@@ -360,7 +395,7 @@ def main(argv=None):
                             connection.send_command(format_joint_gcode(joint_targets_deg))
                             seed_angles_rad = solved_angles_rad
                             if recording_active:
-                                recorded_trajectory.append({
+                                recorded_slots[selected_slot].append({
                                     "t": now - record_start_time,
                                     "angles_deg": np.asarray(joint_targets_deg, dtype=float).copy(),
                                     "pose": np.asarray(target_pose, dtype=float).copy(),
@@ -402,6 +437,15 @@ def main(argv=None):
                 firmware_state = latest_telemetry["state"] if latest_telemetry else "NO LINK"
                 subheader = f"ESP32: {firmware_state} | Fault: {fault_hex} | Telemetry age: {age_ms} ms"
                 screen.blit(font.render(subheader, True, (190, 195, 205)), (16, 39))
+                slot_bar_parts = []
+                for index in range(NUM_RECORD_SLOTS):
+                    slot_text = f"S{index + 1}:{len(recorded_slots[index])}"
+                    if index == selected_slot:
+                        slot_text = f"[{slot_text}]"
+                        if not slot_confirmed:
+                            slot_text = f">{slot_text}<"
+                    slot_bar_parts.append(slot_text)
+                screen.blit(font.render(f"Slots: {' '.join(slot_bar_parts)}", True, (255, 215, 120)), (390, 265))
 
                 screen.blit(font.render("MOTOR CHANNELS (STEP TOTAL / 100 ms DELTA)", True, (120, 180, 255)), (16, 72))
                 steps_list = latest_telemetry["steps"] if latest_telemetry else [0] * 7
@@ -435,9 +479,9 @@ def main(argv=None):
                 screen.blit(font.render(f"RECORD: {'ON' if recording_active else 'OFF'} | REPLAY: {replay_state}", True, (255, 215, 120)), (16, 286))
                 screen.blit(font.render("Cartesian: LS X/Y + RS Y -> XYZ", True, (190, 195, 205)), (16, 307))
                 screen.blit(font.render("J4: LS Y coarse | D-pad / LB / RB fine", True, (190, 195, 205)), (16, 328))
-                screen.blit(font.render("BACK: J4 cal | START/A: zero", True, (190, 195, 205)), (390, 286))
-                screen.blit(font.render("X/R: record | Y/P: replay | B: E-stop", True, (190, 195, 205)), (390, 307))
-                screen.blit(font.render("D: disarm | S/C: setup | A: arm", True, (190, 195, 205)), (390, 328))
+                screen.blit(font.render(f"Slot {selected_slot + 1}: {'LOCKED' if slot_confirmed else 'READY'}", True, (255, 215, 120)), (390, 286))
+                screen.blit(font.render("L/R: slots | A: lock/unlock | START: zero", True, (190, 195, 205)), (390, 307))
+                screen.blit(font.render("X/R: record | Y/P: replay | B: E-stop", True, (190, 195, 205)), (390, 328))
 
                 target_xyz_mm = target_pose[:3, 3] * 1000.0 if target_pose is not None else None
                 measured_xyz_mm = None

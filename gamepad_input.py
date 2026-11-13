@@ -50,6 +50,7 @@ class GamepadController:
             raise RuntimeError("No controller found.")
         self.joystick = pygame.joystick.Joystick(0)
         self.joystick.init()
+        self.prev_hat_x = 0
 
     def poll(self):
         quit_requested = False
@@ -74,8 +75,8 @@ class GamepadController:
                     j4_calibration_toggle = True
                     active_controls.append("BACK/SELECT: toggle J4 calibration")
                 elif event.button == J4_A_BUTTON:
-                    j4_calibration_confirm = True
-                    active_controls.append("A: confirm J4 zero")
+                    actions.append("slot_confirm_toggle")
+                    active_controls.append("A: confirm/deselect slot")
                 elif event.button == START_INIT_BUTTON:
                     actions.append("confirm_i2c")
                     actions.append("confirm_calibration")
@@ -100,6 +101,15 @@ class GamepadController:
                 elif event.key == pygame.K_p:
                     actions.append("trigger_replay")
                     active_controls.append("Key P: Replay motion")
+                elif event.key == pygame.K_LEFT:
+                    actions.append("slot_prev")
+                    active_controls.append("Key LEFT: prev slot")
+                elif event.key == pygame.K_RIGHT:
+                    actions.append("slot_next")
+                    active_controls.append("Key RIGHT: next slot")
+                elif event.key == pygame.K_RETURN:
+                    actions.append("slot_confirm_toggle")
+                    active_controls.append("Key ENTER: confirm/deselect slot")
 
         velocity = [0.0, 0.0, 0.0]
         for axis, coordinate in CARTESIAN_AXIS_TO_XYZ.items():
@@ -114,10 +124,19 @@ class GamepadController:
                     f"{CARTESIAN_AXIS_LABELS[axis]} {velocity[coordinate]:+.2f} m/s"
                 )
 
+        hat_x, hat_y = self.joystick.get_hat(0) if self.joystick.get_numhats() > 0 else (0, 0)
+        if hat_x != 0 and self.prev_hat_x == 0:
+            if hat_x < 0:
+                actions.append("slot_prev")
+                active_controls.append("D-PAD LEFT: prev slot")
+            elif hat_x > 0:
+                actions.append("slot_next")
+                active_controls.append("D-PAD RIGHT: next slot")
+        self.prev_hat_x = hat_x
+
         jog_axis = self.joystick.get_axis(J4_JOG_AXIS) if J4_JOG_AXIS < self.joystick.get_numaxes() else 0.0
         jog_rate = int(round(-apply_deadzone(jog_axis) * J4_JOG_MAX_RATE))
         j4_jog_source = "LS Y" if jog_rate != 0 else "NONE"
-        hat_y = self.joystick.get_hat(0)[1] if self.joystick.get_numhats() > 0 else 0
         if hat_y != 0:
             jog_rate = J4_FINE_JOG_RATE if hat_y > 0 else -J4_FINE_JOG_RATE
             j4_jog_source = "D-PAD UP" if hat_y > 0 else "D-PAD DOWN"
