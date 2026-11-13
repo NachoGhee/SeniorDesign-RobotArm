@@ -11,6 +11,8 @@ class SerialConnection:
         self.port = serial.Serial(port_name, baud_rate, timeout=0)
         self.receive_buffer = bytearray()
         self.last_tx_command = "NONE"
+        self.last_gcode_command = "NONE"
+        self.tx_gcode_count = 0
         self.last_rx_reply = "NONE"
 
     def _read_lines(self):
@@ -36,6 +38,9 @@ class SerialConnection:
 
     def send_command(self, command):
         self.last_tx_command = command
+        if command.startswith(("G0 ", "G1 ")):
+            self.last_gcode_command = command
+            self.tx_gcode_count += 1
         self.port.write((command + "\n").encode("ascii"))
 
     def send_gcode_line(self, command, timeout_s=2.0):

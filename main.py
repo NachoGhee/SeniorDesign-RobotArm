@@ -59,7 +59,7 @@ def main(argv=None):
         connection.close()
         return 1
 
-    screen = pygame.display.set_mode((760, 480))
+    screen = pygame.display.set_mode((840, 520))
     pygame.display.set_caption("POSE Arm Kinematics & Telemetry HUD")
     font = pygame.font.SysFont("consolas", 15)
 
@@ -412,31 +412,80 @@ def main(argv=None):
                     row = f"{label:<6} | {steps_list[index]:>9d} | {pulse_state}"
                     screen.blit(font.render(row, True, color), (16, 98 + index * 25))
 
-                screen.blit(font.render("JOINT ANGLES (MEASURED -> TARGET)", True, (120, 180, 255)), (390, 72))
+                screen.blit(font.render("JOINT ANGLES: HW MEASURED -> SW TARGET (ERR)", True, (120, 180, 255)), (390, 72))
                 angles_list = latest_telemetry["angles"] if latest_telemetry else [float("nan")] * 6
                 for index, label in enumerate(JOINT_LABELS):
                     measured = angles_list[index]
-                    measured_text = f"{measured:>7.2f}" if np.isfinite(measured) else "   NONE"
-                    target_text = f"{joint_targets_deg[index]:>7.2f}"
-                    row = f"{label}: {measured_text} -> {target_text} deg"
-                    screen.blit(font.render(row, True, (235, 235, 235)), (390, 98 + index * 25))
+                    target = joint_targets_deg[index]
+                    if np.isfinite(measured):
+                        err_deg = target - measured
+                        measured_text = f"{measured:>7.2f}"
+                        err_text = f"{err_deg:+6.2f}"
+                        joint_color = (80, 255, 140) if abs(err_deg) <= 2.0 else (255, 215, 90)
+                    else:
+                        measured_text = "   NONE"
+                        err_text = "   N/A"
+                        joint_color = (210, 210, 210)
+                    target_text = f"{target:>7.2f}"
+                    row = f"{label}: {measured_text} -> {target_text} ({err_text}) deg"
+                    screen.blit(font.render(row, True, joint_color), (390, 98 + index * 25))
 
                 input_text = last_controller_input
                 screen.blit(font.render(f"INPUT IN USE: {input_text}", True, (255, 215, 120)), (16, 265))
                 screen.blit(font.render(f"RECORD: {'ON' if recording_active else 'OFF'} | REPLAY: {replay_state}", True, (255, 215, 120)), (16, 286))
                 screen.blit(font.render("Cartesian: LS X/Y + RS Y -> XYZ", True, (190, 195, 205)), (16, 307))
                 screen.blit(font.render("J4: LS Y coarse | D-pad / LB / RB fine", True, (190, 195, 205)), (16, 328))
-                screen.blit(font.render("BACK: J4 cal | START/A: zero", True, (190, 195, 205)), (390, 307))
-                screen.blit(font.render("X/R: record | Y/P: replay | B: E-stop", True, (190, 195, 205)), (390, 328))
+                screen.blit(font.render("BACK: J4 cal | START/A: zero", True, (190, 195, 205)), (390, 286))
+                screen.blit(font.render("X/R: record | Y/P: replay | B: E-stop", True, (190, 195, 205)), (390, 307))
+                screen.blit(font.render("D: disarm | S/C: setup | A: arm", True, (190, 195, 205)), (390, 328))
 
-                if target_pose is not None:
-                    x_mm, y_mm, z_mm = target_pose[:3, 3] * 1000.0
-                    xyz_text = f"Cartesian target (mm): X={x_mm:7.2f}  Y={y_mm:7.2f}  Z={z_mm:7.2f}"
+                target_xyz_mm = target_pose[:3, 3] * 1000.0 if target_pose is not None else None
+                measured_xyz_mm = None
+                if ik_ready and len(angles_list) == 6 and np.all(np.isfinite(angles_list)):
+                    try:
+                        meas_rad = ikgeo_model.encoder_degrees_to_model_radians(np.asarray(angles_list, dtype=float))
+                        meas_pose = ikgeo_model.forward_camera_pose(meas_rad)
+                        measured_xyz_mm = meas_pose[:3, 3] * 1000.0
+                    except (ValueError, ikgeo_model.RobotModelNotConfigured):
+                        measured_xyz_mm = None
+
+                if target_xyz_mm is not None:
+                    tx_mm, ty_mm, tz_mm = target_xyz_mm
+                    target_xyz_text = f"SW Target 3D (mm):   X={tx_mm:7.2f}  Y={ty_mm:7.2f}  Z={tz_mm:7.2f}"
                 else:
-                    xyz_text = "Cartesian target (mm): waiting for valid telemetry"
-                screen.blit(font.render(xyz_text, True, (255, 220, 120)), (16, 355))
-                screen.blit(font.render(f"Last TX: {connection.last_tx_command}", True, (180, 230, 180)), (16, 385))
-                screen.blit(font.render(f"Last ESP32 reply: {connection.last_rx_reply}", True, (230, 190, 160)), (16, 410))
+                    target_xyz_text = "SW Target 3D (mm):   waiting for valid telemetry / arming"
+
+                if measured_xyz_mm is not None:
+                    mx_mm, my_mm, mz_mm = measured_xyz_mm
+                    if target_xyz_mm is not None:
+                        err_mm = float(np.linalg.norm(target_xyz_mm - measured_xyz_mm))
+                        meas_xyz_text = (
+                            f"HW Measured 3D (mm): X={mx_mm:7.2f}  Y={my_mm:7.2f}  Z={mz_mm:7.2f}"
+                            f"  | 3D Err: {err_mm:6.2f} mm"
+                        )
+                    else:
+                        meas_xyz_text = f"HW Measured 3D (mm): X={mx_mm:7.2f}  Y={my_mm:7.2f}  Z={mz_mm:7.2f}"
+                else:
+                    meas_xyz_text = "HW Measured 3D (mm): waiting for 6 valid encoder readings"
+
+                screen.blit(font.render(target_xyz_text, True, (255, 220, 120)), (16, 360))
+                screen.blit(font.render(meas_xyz_text, True, (130, 235, 255)), (16, 384))
+                screen.blit(
+                    font.render(
+                        f"Live G-Code TX (#{connection.tx_gcode_count}): {connection.last_gcode_command}",
+                        True,
+                        (140, 250, 160),
+                    ),
+                    (16, 416),
+                )
+                screen.blit(
+                    font.render(
+                        f"Last CMD TX: {connection.last_tx_command} | Last ESP32 RX: {connection.last_rx_reply}",
+                        True,
+                        (230, 190, 160),
+                    ),
+                    (16, 440),
+                )
                 pygame.display.flip()
 
     except KeyboardInterrupt:
