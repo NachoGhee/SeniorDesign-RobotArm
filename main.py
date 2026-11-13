@@ -59,7 +59,7 @@ def main(argv=None):
         connection.close()
         return 1
 
-    screen = pygame.display.set_mode((760, 460))
+    screen = pygame.display.set_mode((760, 480))
     pygame.display.set_caption("POSE Arm Kinematics & Telemetry HUD")
     font = pygame.font.SysFont("consolas", 15)
 
@@ -99,32 +99,38 @@ def main(argv=None):
     clock = pygame.time.Clock()
     running = True
 
+    def reset_motion_state(clear_calibration=False):
+        nonlocal recording_active, replay_state, target_pose, seed_angles_rad, controller_ready
+        nonlocal j4_calibration_mode, last_j4_jog_rate
+        recording_active = False
+        replay_state = "IDLE"
+        target_pose = None
+        seed_angles_rad = None
+        controller_ready = False
+        if clear_calibration:
+            j4_calibration_mode = False
+            last_j4_jog_rate = 0
+
     try:
         while running:
             dt = min(clock.tick(50) / 1000.0, 0.1)
+            now = time.monotonic()
             gamepad_update = controller.poll()
             if gamepad_update.quit_requested:
                 running = False
             for action in gamepad_update.actions:
                 if action == "estop":
                     connection.send_command("X")
-                    recording_active = False
-                    replay_state = "IDLE"
+                    reset_motion_state(clear_calibration=True)
                     print("E-stop sent; controller must be power-cycled to clear it.")
                     running = False
                 elif action == "disarm":
                     connection.send_command("DISARM")
-                    recording_active = False
-                    replay_state = "IDLE"
-                    j4_calibration_mode = False
-                    last_j4_jog_rate = 0
-                    target_pose = None
-                    seed_angles_rad = None
-                    controller_ready = False
+                    reset_motion_state(clear_calibration=True)
                 elif action == "toggle_record":
                     if j4_calibration_mode:
                         print("Recording disabled while J4 calibration mode is active.")
-                    elif not controller_ready or not ik_ready or target_pose is None:
+                    elif not controller_ready or not ik_ready or target_pose is None or seed_angles_rad is None:
                         print("Recording requires a ready controller and valid Cartesian target.")
                     elif recording_active:
                         recording_active = False
@@ -132,57 +138,54 @@ def main(argv=None):
                     else:
                         replay_state = "IDLE"
                         recorded_trajectory = []
-                        record_start_time = now = time.monotonic()
+                        record_start_time = now
                         recording_active = True
                         seed_copy = np.array(seed_angles_rad, dtype=float, copy=True)
                         pose_copy = np.array(target_pose, dtype=float, copy=True)
+                        initial_angles = np.asarray(
+                            ikgeo_model.model_radians_to_encoder_degrees(seed_copy), dtype=float
+                        ).copy()
                         recorded_trajectory.append({
                             "t": 0.0,
-                            "angles_deg": np.asarray(
-                                ikgeo_model.model_radians_to_encoder_degrees(seed_copy), dtype=float
-                            ).copy(),
+                            "angles_deg": initial_angles,
                             "pose": pose_copy,
                             "seed_rad": seed_copy,
                         })
+                        joint_targets_deg = initial_angles.copy()
                         print("Recording started.")
                 elif action == "trigger_replay":
                     if replay_state in {"HOMING", "PLAYING"}:
                         replay_state = "IDLE"
                         recording_active = False
-                        print("Replay cancelled.")
+                        target_pose = None
+                        seed_angles_rad = None
+                        print("Replay cancelled; re-locking onto current measured pose.")
                     elif not recorded_trajectory:
                         print("Replay blocked: no recorded trajectory available.")
-                    elif not controller_ready:
+                    elif not controller_ready or not ik_ready:
                         print("Replay blocked: controller telemetry is not ready.")
                     else:
                         recording_active = False
                         replay_state = "HOMING"
-                        replay_start_time = time.monotonic()
+                        replay_start_time = now
                         replay_frame_index = 0
-                        start_angles = np.asarray(recorded_trajectory[0]["angles_deg"], dtype=float)
-                        connection.send_command(format_joint_gcode(start_angles))
+                        start_frame = recorded_trajectory[0]
+                        target_pose = np.array(start_frame["pose"], dtype=float, copy=True)
+                        seed_angles_rad = np.array(start_frame["seed_rad"], dtype=float, copy=True)
+                        joint_targets_deg = np.asarray(start_frame["angles_deg"], dtype=float).copy()
+                        last_send = now
+                        connection.send_command(format_joint_gcode(joint_targets_deg))
                         print("Replay started: homing to the recorded start pose.")
 
             if gamepad_update.j4_calibration_toggle:
+                connection.send_command("DISARM")
                 if j4_calibration_mode:
-                    connection.send_command("DISARM")
-                    recording_active = False
-                    replay_state = "IDLE"
-                    j4_calibration_mode = False
-                    last_j4_jog_rate = 0
-                    target_pose = None
-                    seed_angles_rad = None
-                    controller_ready = False
+                    reset_motion_state(clear_calibration=True)
                     print("J4 calibration mode stopped.")
                 else:
-                    connection.send_command("DISARM")
-                    recording_active = False
-                    replay_state = "IDLE"
+                    reset_motion_state(clear_calibration=False)
                     j4_calibration_mode = True
                     last_j4_jog_rate = 0
-                    target_pose = None
-                    seed_angles_rad = None
-                    controller_ready = False
                     print("J4 calibration mode: align the witness marks, then press START or A.")
 
             now = time.monotonic()
@@ -218,11 +221,7 @@ def main(argv=None):
                 prev_steps = list(steps)
                 latest_telemetry = telemetry
                 if telemetry["faults"]:
-                    recording_active = False
-                    replay_state = "IDLE"
-                    target_pose = None
-                    seed_angles_rad = None
-                    controller_ready = False
+                    reset_motion_state()
                 elif telemetry["ready"] and len(telemetry["angles"]) == 6 and np.all(
                     np.isfinite(telemetry["angles"])
                 ):
@@ -234,32 +233,33 @@ def main(argv=None):
                                 np.asarray(telemetry["angles"], dtype=float)
                             )
                             target_pose = ikgeo_model.forward_camera_pose(seed_angles_rad)
+                            joint_targets_deg = np.asarray(
+                                ikgeo_model.model_radians_to_encoder_degrees(seed_angles_rad), dtype=float
+                            ).copy()
                             print("Cartesian target initialized from measured camera pose.")
                         except (ValueError, ikgeo_model.RobotModelNotConfigured) as error:
                             ik_ready = False
                             print(f"Cartesian IK disabled: {error}")
                 else:
-                    controller_ready = False
-                    target_pose = None
-                    seed_angles_rad = None
+                    reset_motion_state()
 
             if now - last_telemetry_time > 0.5:
-                recording_active = False
-                replay_state = "IDLE"
-                controller_ready = False
-                target_pose = None
-                seed_angles_rad = None
+                reset_motion_state()
 
-            if replay_state == "HOMING":
+            if replay_state == "HOMING" and controller_ready and ik_ready:
                 if not recorded_trajectory:
                     replay_state = "IDLE"
                 else:
-                    start_error = np.max(
-                        np.abs(
-                            np.asarray(latest_telemetry["angles"], dtype=float)
-                            - np.asarray(recorded_trajectory[0]["angles_deg"], dtype=float)
+                    start_error = (
+                        np.max(
+                            np.abs(
+                                np.asarray(latest_telemetry["angles"], dtype=float)
+                                - np.asarray(recorded_trajectory[0]["angles_deg"], dtype=float)
+                            )
                         )
-                    ) if latest_telemetry is not None else float("inf")
+                        if latest_telemetry is not None
+                        else float("inf")
+                    )
                     runtime = now - replay_start_time
                     if runtime >= REPLAY_HOMING_TIMEOUT_S or start_error <= REPLAY_START_TOLERANCE_DEG:
                         replay_state = "PLAYING"
@@ -272,24 +272,34 @@ def main(argv=None):
                                 format_joint_gcode(np.asarray(recorded_trajectory[0]["angles_deg"], dtype=float))
                             )
                             last_send = now
-            if replay_state == "PLAYING":
+            elif replay_state == "PLAYING" and controller_ready and ik_ready:
                 if not recorded_trajectory:
                     replay_state = "IDLE"
                 else:
                     elapsed = now - replay_start_time
-                    while replay_frame_index + 1 < len(recorded_trajectory) and elapsed >= recorded_trajectory[replay_frame_index + 1]["t"]:
-                        replay_frame_index += 1
-                    frame = recorded_trajectory[replay_frame_index]
-                    target_pose = np.array(frame["pose"], dtype=float, copy=True)
-                    seed_angles_rad = np.array(frame["seed_rad"], dtype=float, copy=True)
-                    joint_targets_deg = np.asarray(frame["angles_deg"], dtype=float).copy()
-                    if now - last_send >= SEND_PERIOD_S:
+                    if elapsed >= recorded_trajectory[-1]["t"]:
+                        frame = recorded_trajectory[-1]
+                        target_pose = np.array(frame["pose"], dtype=float, copy=True)
+                        seed_angles_rad = np.array(frame["seed_rad"], dtype=float, copy=True)
+                        joint_targets_deg = np.asarray(frame["angles_deg"], dtype=float).copy()
                         connection.send_command(format_joint_gcode(joint_targets_deg))
                         last_send = now
-                    if elapsed >= recorded_trajectory[-1]["t"]:
                         replay_state = "IDLE"
                         recording_active = False
                         print("Replay complete.")
+                    else:
+                        while (
+                            replay_frame_index + 1 < len(recorded_trajectory)
+                            and elapsed >= recorded_trajectory[replay_frame_index + 1]["t"]
+                        ):
+                            replay_frame_index += 1
+                        frame = recorded_trajectory[replay_frame_index]
+                        target_pose = np.array(frame["pose"], dtype=float, copy=True)
+                        seed_angles_rad = np.array(frame["seed_rad"], dtype=float, copy=True)
+                        joint_targets_deg = np.asarray(frame["angles_deg"], dtype=float).copy()
+                        if now - last_send >= SEND_PERIOD_S or last_send == 0.0:
+                            connection.send_command(format_joint_gcode(joint_targets_deg))
+                            last_send = now
 
             if j4_calibration_mode:
                 jog_rate = gamepad_update.j4_jog_rate
@@ -413,20 +423,20 @@ def main(argv=None):
 
                 input_text = last_controller_input
                 screen.blit(font.render(f"INPUT IN USE: {input_text}", True, (255, 215, 120)), (16, 265))
-                screen.blit(font.render(f"RECORD: {'ON' if recording_active else 'OFF'} | REPLAY: {replay_state}", True, (255, 215, 120)), (16, 288))
-                screen.blit(font.render("Cartesian: LS X/Y + RS Y -> XYZ", True, (190, 195, 205)), (16, 308))
+                screen.blit(font.render(f"RECORD: {'ON' if recording_active else 'OFF'} | REPLAY: {replay_state}", True, (255, 215, 120)), (16, 286))
+                screen.blit(font.render("Cartesian: LS X/Y + RS Y -> XYZ", True, (190, 195, 205)), (16, 307))
                 screen.blit(font.render("J4: LS Y coarse | D-pad / LB / RB fine", True, (190, 195, 205)), (16, 328))
-                screen.blit(font.render("BACK: calibration | START/A: zero | R: record | P: replay", True, (190, 195, 205)), (390, 288))
-                screen.blit(font.render("B: E-stop | D: disarm | S/C: setup", True, (190, 195, 205)), (390, 308))
+                screen.blit(font.render("BACK: J4 cal | START/A: zero", True, (190, 195, 205)), (390, 307))
+                screen.blit(font.render("X/R: record | Y/P: replay | B: E-stop", True, (190, 195, 205)), (390, 328))
 
                 if target_pose is not None:
                     x_mm, y_mm, z_mm = target_pose[:3, 3] * 1000.0
                     xyz_text = f"Cartesian target (mm): X={x_mm:7.2f}  Y={y_mm:7.2f}  Z={z_mm:7.2f}"
                 else:
                     xyz_text = "Cartesian target (mm): waiting for valid telemetry"
-                screen.blit(font.render(xyz_text, True, (255, 220, 120)), (16, 340))
-                screen.blit(font.render(f"Last TX: {connection.last_tx_command}", True, (180, 230, 180)), (16, 372))
-                screen.blit(font.render(f"Last ESP32 reply: {connection.last_rx_reply}", True, (230, 190, 160)), (16, 397))
+                screen.blit(font.render(xyz_text, True, (255, 220, 120)), (16, 355))
+                screen.blit(font.render(f"Last TX: {connection.last_tx_command}", True, (180, 230, 180)), (16, 385))
+                screen.blit(font.render(f"Last ESP32 reply: {connection.last_rx_reply}", True, (230, 190, 160)), (16, 410))
                 pygame.display.flip()
 
     except KeyboardInterrupt:
